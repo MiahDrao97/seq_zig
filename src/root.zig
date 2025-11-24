@@ -5,7 +5,7 @@
 //!
 //! ```zig
 //! // assuming imports...
-//! // assuming Io and Allocator interfaces...
+//! // assuming Allocator interface...
 //!
 //! // assign the `seqLogFn` to the `logFn`
 //! pub const std_options: std.Options = .{ .logFn = seqLogFn };
@@ -147,10 +147,9 @@ const SeqClient = struct {
         comptime log: []const u8,
         args: anytype,
     ) Allocator.Error!void {
-        _ = scope;
-        _ = log;
-
         const ArgsType = @TypeOf(args);
+        const is_tuple: bool = @typeInfo(ArgsType).@"struct".is_tuple;
+
         // critical section
         self.mutex.lock();
         defer self.mutex.unlock();
@@ -161,7 +160,7 @@ const SeqClient = struct {
         var date_time_buf: [24]u8 = undefined;
 
         var seq_payload: SeqBody(ArgsType) = undefined;
-        // TODO : message itself (we need to restructure the log, however)
+        seq_payload.Context = scope;
         seq_payload.@"@t" = util.utcNowAsIsoString(&date_time_buf); // timestamp
         seq_payload.@"@l" = switch (level) { // log level
             .debug => .Debug,
@@ -169,11 +168,68 @@ const SeqClient = struct {
             .warn => .Warning,
             .err => .Error,
         };
-        if (!@typeInfo(ArgsType).@"struct".is_tuple) {
-            inline for (@typeInfo(ArgsType).@"struct".fields) |field| {
-                @field(seq_payload, field.name) = @field(args, field.name);
+
+        var arena: ArenaAllocator = .init(self.bytes.allocator);
+        defer arena.deinit();
+        if (!is_tuple) {
+            // copy fields from args struct, which then become parameterized values given to Seq
+
+            comptime var i: usize = 0;
+            comptime var begin_arg_name: usize = undefined;
+            comptime var begin_specifier: usize = undefined;
+            comptime var arg_name_len: usize = 0;
+            comptime var specifier_len: usize = 0;
+
+            const state: enum { begin_field, arg_name, specificier, none } = .none;
+            loop: switch (state) {
+                .none => {
+                    if (i >= log.len) break :loop;
+                    if (log[i] == '{') continue :loop .begin_field;
+                    i += 1;
+                    continue :loop .none;
+                },
+                .begin_field => {
+                    debug.assert(log[i] == '[');
+                    i += 1;
+                    begin_arg_name = i;
+                    continue :loop .arg_name;
+                },
+                .arg_name => {
+                    defer i += 1;
+                    if (log[i] == ']') {
+                        begin_specifier = i + 1;
+                        continue :loop .specificier;
+                    }
+                    arg_name_len += 1;
+                    continue :loop .arg_name;
+                },
+                .specifier => {
+                    defer i += 1;
+                    if (log[i] == '}') {
+                        defer {
+                            arg_name_len = 0;
+                            specifier_len = 0;
+                            _ = arena.reset(.retain_capacity);
+                        }
+                        const arg_name: []const u8 = log[begin_arg_name..][0..arg_name_len];
+                        const specifier: []const u8 = log[begin_specifier..][0..specifier_len];
+
+                        var stream: Io.Writer.Allocating = .init(arena.allocator());
+                        stream.writer.print("{" ++ specifier ++ "}", .{@field(args, arg_name)}) catch return error.OutOfMemory;
+                        @field(seq_payload, arg_name) = stream.written();
+
+                        continue :loop .none;
+                    }
+                    specifier_len += 1;
+                    continue :loop .specificier;
+                },
             }
         }
+
+        // very unlikely that we'll allocate any more than this, but it's technically possible, so I don't trust a stack buffer
+        var message_stream: Io.Writer.Allocating = try .initCapacity(arena.allocator(), log.len);
+        message_stream.writer.print(log, args) catch return error.OutOfMemory;
+        seq_payload.@"@m" = message_stream.written();
 
         var serializer: json.Stringify = .{
             .writer = &self.bytes.writer,
@@ -232,11 +288,23 @@ const SeqClient = struct {
 const LogIndex = enum(u32) { _ };
 
 fn SeqBody(comptime TBody: type) type {
-    const existing_fields: []const StructField = @typeInfo(TBody).@"struct".fields;
+    const derived_fields: []StructField = if (@typeInfo(TBody).@"struct".is_tuple)
+        &.{} // don't add in fields from a tuple since they're all "0", "1", etc., and that's really meh for structured logging
+    else struct_fields: {
+        var fields: [@typeInfo(TBody).@"struct".fields.len]StructField = undefined;
+        for (&fields, @typeInfo(TBody).@"struct".fields) |*derived, field| derived.* = .{
+            .name = field.name,
+            .type = []const u8, // all of these are gonna be strings
+            .default_value_ptr = "", // default to empty string
+            .alignment = 0,
+            .is_comptime = false,
+        };
+        break :struct_fields &fields;
+    };
 
     return @as(type, @Type(.{
         .@"struct" = .{
-            .fields = existing_fields ++ &.{
+            .fields = &derived_fields ++ &.{
                 .{
                     .name = "@t",
                     .type = []const u8,
@@ -251,12 +319,31 @@ fn SeqBody(comptime TBody: type) type {
                     .alignment = 0,
                     .is_comptime = false,
                 },
+                .{
+                    .name = "@m",
+                    .type = []const u8,
+                    .default_value_ptr = "",
+                    .alignment = 0,
+                    .is_comptime = false,
+                },
+                .{
+                    .name = "Context",
+                    .type = []const u8,
+                    .default_value_ptr = "",
+                    .alignment = 0,
+                    .is_comptime = false,
+                },
             },
             .decls = &.{},
             .is_tuple = false,
             .layout = .auto,
         },
     }));
+}
+
+test {
+    // TODO : Test the serialization and parameterized values
+    _ = SeqClient;
 }
 
 const std = @import("std");
@@ -268,6 +355,7 @@ const Thread = std.Thread;
 const Mutex = Thread.Mutex;
 const Atomic = std.atomic.Value;
 const Allocator = std.mem.Allocator;
+const ArenaAllocator = std.heap.ArenaAllocator;
 const ArrayList = std.ArrayList;
 const Uri = std.Uri;
 const HttpClient = std.http.Client;
