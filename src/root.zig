@@ -171,6 +171,7 @@ const SeqClient = struct {
         defer arena.deinit();
 
         if (!@typeInfo(ArgsType).@"struct".is_tuple) {
+            // copy fields from args struct, which then become parameterized values given to Seq
             const params: [@typeInfo(ArgsType).@"struct".fields.len]ParamsAndSpecifiers = parametersAndSpecifiers(log, ArgsType);
             inline for (&params) |p| {
                 var stream: Io.Writer.Allocating = .init(arena.allocator());
@@ -209,8 +210,6 @@ const SeqClient = struct {
         comptime TArgs: type,
     ) [@typeInfo(TArgs).@"struct".fields.len]ParamsAndSpecifiers {
         comptime var result: [@typeInfo(TArgs).@"struct".fields.len]ParamsAndSpecifiers = undefined;
-
-        // copy fields from args struct, which then become parameterized values given to Seq
         comptime var idx: usize = 0;
         comptime var begin_arg_name: usize = undefined;
         comptime var begin_specifier: usize = undefined;
@@ -249,7 +248,6 @@ const SeqClient = struct {
                 } else specifier_len += 1;
             },
         };
-
         return result;
     }
 
