@@ -3,9 +3,9 @@
 /// UTC now, formatted as YYYY-MM-DDThh:mm:ss.fffZ
 pub fn utcNowAsIsoString(buf: *[24]u8) []const u8 {
     const ms_now: i64 = std.time.milliTimestamp();
-    const sec_now: i64 = try std.math.divFloor(i64, ms_now, 1000);
-    const minutes_now: i64 = try std.math.divFloor(i64, sec_now, 60);
-    const hours_now: i64 = try std.math.divFloor(i64, minutes_now, 60);
+    const sec_now: i64 = std.math.divFloor(i64, ms_now, 1000) catch unreachable;
+    const minutes_now: i64 = std.math.divFloor(i64, sec_now, 60) catch unreachable;
+    const hours_now: i64 = std.math.divFloor(i64, minutes_now, 60) catch unreachable;
 
     const ms: i64 = @mod(ms_now, 1000);
     const sec: i64 = @mod(sec_now, 60);

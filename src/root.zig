@@ -129,6 +129,11 @@ const SeqClient = struct {
     sw: Stopwatch,
     mutex: Mutex,
 
+    const ParamsAndSpecifiers = struct {
+        param: []const u8,
+        specifier: []const u8,
+    };
+
     fn init(gpa: Allocator, config: SeqConfig) (Allocator.Error || Stopwatch.Error)!SeqClient {
         return .{
             .bytes = try .initCapacity(gpa, config.log_capacity * 2),
@@ -147,20 +152,10 @@ const SeqClient = struct {
         comptime log: []const u8,
         args: anytype,
     ) Allocator.Error!void {
-        const ArgsType = @TypeOf(args);
-        const is_tuple: bool = @typeInfo(ArgsType).@"struct".is_tuple;
-
-        // critical section
-        self.mutex.lock();
-        defer self.mutex.unlock();
-
-        const offset: LogIndex = @enumFromInt(self.bytes.written().len);
-        try self.indices.append(self.bytes.allocator, offset);
-
         var date_time_buf: [24]u8 = undefined;
 
-        var seq_payload: SeqBody(ArgsType) = undefined;
-        seq_payload.scope = scope;
+        var seq_payload: SeqBody(@TypeOf(args)) = undefined;
+        seq_payload.scope = @tagName(scope);
         seq_payload.@"@t" = util.utcNowAsIsoString(&date_time_buf); // timestamp
         seq_payload.@"@l" = switch (level) { // log level
             .debug => .Debug,
@@ -171,57 +166,14 @@ const SeqClient = struct {
 
         var arena: ArenaAllocator = .init(self.bytes.allocator);
         defer arena.deinit();
-        if (!is_tuple) {
-            // copy fields from args struct, which then become parameterized values given to Seq
 
-            comptime var i: usize = 0;
-            comptime var begin_arg_name: usize = undefined;
-            comptime var begin_specifier: usize = undefined;
-            comptime var arg_name_len: usize = 0;
-            comptime var specifier_len: usize = 0;
-
-            const state: enum { begin_field, arg_name, specificier, none } = .none;
-            loop: switch (state) {
-                .none => {
-                    if (i >= log.len) break :loop;
-                    if (log[i] == '{') continue :loop .begin_field;
-                    i += 1;
-                    continue :loop .none;
-                },
-                .begin_field => {
-                    debug.assert(log[i] == '[');
-                    i += 1;
-                    begin_arg_name = i;
-                    continue :loop .arg_name;
-                },
-                .arg_name => {
-                    defer i += 1;
-                    if (log[i] == ']') {
-                        begin_specifier = i + 1;
-                        continue :loop .specificier;
-                    }
-                    arg_name_len += 1;
-                    continue :loop .arg_name;
-                },
-                .specifier => {
-                    defer i += 1;
-                    if (log[i] == '}') {
-                        defer {
-                            arg_name_len = 0;
-                            specifier_len = 0;
-                        }
-                        const arg_name: []const u8 = log[begin_arg_name..][0..arg_name_len];
-                        const specifier: []const u8 = log[begin_specifier..][0..specifier_len];
-
-                        var stream: Io.Writer.Allocating = .init(arena.allocator());
-                        stream.writer.print("{" ++ specifier ++ "}", .{@field(args, arg_name)}) catch return error.OutOfMemory;
-                        @field(seq_payload, arg_name) = stream.written();
-
-                        continue :loop .none;
-                    }
-                    specifier_len += 1;
-                    continue :loop .specificier;
-                },
+        const ArgsType = @TypeOf(args);
+        if (!@typeInfo(ArgsType).@"struct".is_tuple) {
+            const params: [@typeInfo(ArgsType).@"struct".fields.len]ParamsAndSpecifiers = parametersAndSpecifiers(log, ArgsType);
+            inline for (&params) |p| {
+                var stream: Io.Writer.Allocating = .init(arena.allocator());
+                stream.writer.print("{" ++ p.specifier ++ "}", .{@field(args, p.param)}) catch return error.OutOfMemory;
+                @field(seq_payload, p.param) = stream.written();
             }
         }
 
@@ -230,15 +182,73 @@ const SeqClient = struct {
         message_stream.writer.print(log, args) catch return error.OutOfMemory;
         seq_payload.@"@m" = message_stream.written();
 
-        var serializer: json.Stringify = .{
-            .writer = &self.bytes.writer,
-            .options = .{},
-        };
-        // write the payload body into the bytes
-        serializer.write(seq_payload) catch return error.OutOfMemory;
+        // critical section
+        {
+            self.mutex.lock();
+            defer self.mutex.unlock();
 
-        // append a null byte at the end
-        try self.bytes.writer.writeByte(0);
+            const offset: LogIndex = @enumFromInt(self.bytes.written().len);
+            try self.indices.append(self.bytes.allocator, offset);
+
+            var serializer: json.Stringify = .{
+                .writer = &self.bytes.writer,
+                .options = .{},
+            };
+            // write the payload body into the bytes
+            serializer.write(seq_payload) catch return error.OutOfMemory;
+
+            // append a null byte at the end
+            self.bytes.writer.writeByte(0) catch return error.OutOfMemory;
+        }
+    }
+
+    inline fn parametersAndSpecifiers(
+        comptime log: []const u8,
+        comptime TArgs: type,
+    ) [@typeInfo(TArgs).@"struct".fields.len]ParamsAndSpecifiers {
+        comptime var result: [@typeInfo(TArgs).@"struct".fields.len]ParamsAndSpecifiers = undefined;
+
+        // copy fields from args struct, which then become parameterized values given to Seq
+        comptime var idx: usize = 0;
+        comptime var begin_arg_name: usize = undefined;
+        comptime var begin_specifier: usize = undefined;
+        comptime var arg_name_len: usize = 0;
+        comptime var specifier_len: usize = 0;
+        comptime var state: enum { begin_field, arg_name, specifier, none } = .none;
+        comptime outer: for (log, 0..) |char, i| switch (state) {
+            .none => if (char == '{') {
+                state = .begin_field;
+            },
+            .begin_field => {
+                debug.assert(char == '[' and i + 1 < log.len); // should be checked by comptime
+                begin_arg_name = i + 1;
+                state = .arg_name;
+            },
+            .arg_name => {
+                if (char == ']') {
+                    begin_specifier = i + 1;
+                    state = .specifier;
+                } else arg_name_len += 1;
+            },
+            .specifier => {
+                if (char == '}') {
+                    defer {
+                        arg_name_len = 0;
+                        specifier_len = 0;
+                        state = .none;
+                    }
+                    const arg_name: []const u8 = log[begin_arg_name..][0..arg_name_len];
+                    const specifier: []const u8 = log[begin_specifier..][0..specifier_len];
+                    for (0..idx) |j| {
+                        if (std.mem.eql(u8, arg_name, result[j].param)) continue :outer;
+                    }
+                    result[idx] = .{ .param = arg_name, .specifier = specifier };
+                    idx += 1;
+                } else specifier_len += 1;
+            },
+        };
+
+        return result;
     }
 
     fn evaluate(self: *SeqClient) HttpClient.RequestError!void {
@@ -287,52 +297,53 @@ const SeqClient = struct {
 const LogIndex = enum(u32) { _ };
 
 fn SeqBody(comptime TBody: type) type {
-    const derived_fields: []StructField = if (@typeInfo(TBody).@"struct".is_tuple)
-        &.{} // don't add in fields from a tuple since they're all "0", "1", etc., and that's really meh for structured logging
+    const derived_fields = if (@typeInfo(TBody).@"struct".is_tuple)
+        [_]StructField{} // don't add in fields from a tuple since they're all "0", "1", etc., and that's really meh for structured logging
     else struct_fields: {
         var fields: [@typeInfo(TBody).@"struct".fields.len]StructField = undefined;
         for (&fields, @typeInfo(TBody).@"struct".fields) |*derived, field| derived.* = .{
             .name = field.name,
             .type = []const u8, // all of these are gonna be strings
-            .default_value_ptr = "", // default to empty string
-            .alignment = 0,
+            .default_value_ptr = @ptrCast(@as(*const []const u8, &"")), // default to empty strnig
+            .alignment = @alignOf([]const u8),
             .is_comptime = false,
         };
-        break :struct_fields &fields;
+        break :struct_fields fields;
     };
 
+    const SeqLogLevel = enum { Verbose, Debug, Information, Warning, Error, Fatal };
     return @as(type, @Type(.{
         .@"struct" = .{
-            .fields = &derived_fields ++ &.{
+            .fields = &(derived_fields ++ [_]StructField{
                 .{
                     .name = "@t",
                     .type = []const u8,
                     .default_value_ptr = null,
-                    .alignment = 0,
+                    .alignment = @alignOf([]const u8),
                     .is_comptime = false,
                 },
                 .{
                     .name = "@l",
-                    .type = enum { Verbose, Debug, Information, Warning, Error, Fatal },
+                    .type = SeqLogLevel,
                     .default_value_ptr = null,
-                    .alignment = 0,
+                    .alignment = @alignOf(SeqLogLevel),
                     .is_comptime = false,
                 },
                 .{
                     .name = "@m",
                     .type = []const u8,
-                    .default_value_ptr = "",
-                    .alignment = 0,
+                    .default_value_ptr = @ptrCast(@as(*const []const u8, &"")),
+                    .alignment = @alignOf([]const u8),
                     .is_comptime = false,
                 },
                 .{
                     .name = "scope",
                     .type = []const u8,
-                    .default_value_ptr = "",
-                    .alignment = 0,
+                    .default_value_ptr = @ptrCast(@as(*const []const u8, &"")),
+                    .alignment = @alignOf([]const u8),
                     .is_comptime = false,
                 },
-            },
+            }),
             .decls = &.{},
             .is_tuple = false,
             .layout = .auto,
@@ -340,9 +351,94 @@ fn SeqBody(comptime TBody: type) type {
     }));
 }
 
-test {
-    // TODO : Test the serialization and parameterized values
-    _ = SeqClient;
+test "SeqClient.writeLog" {
+    var client: SeqClient = try .init(testing.allocator, .{ .url = undefined, .api_key = "" });
+    defer client.deinit(testing.allocator);
+
+    // empty args
+    {
+        defer client.reset();
+
+        try client.writeLog(.debug, .testing, "This is a log", .{});
+        const Body = SeqBody(@TypeOf(.{}));
+
+        const written: []const u8 = std.mem.sliceTo(client.bytes.written(), 0);
+        const parsed: json.Parsed(Body) = try json.parseFromSlice(Body, testing.allocator, written, .{});
+        defer parsed.deinit();
+
+        try testing.expectEqualStrings(parsed.value.scope, @tagName(.testing));
+        try testing.expectEqual(parsed.value.@"@l", .Debug);
+        try testing.expectEqualStrings(parsed.value.@"@m", "This is a log");
+    }
+    // tuple
+    {
+        defer client.reset();
+
+        try client.writeLog(.debug, .testing, "This is a log {d}: {s}", .{ 0, "yay" });
+        const Body = SeqBody(@TypeOf(.{}));
+
+        const written: []const u8 = std.mem.sliceTo(client.bytes.written(), 0);
+        const parsed: json.Parsed(Body) = try json.parseFromSlice(Body, testing.allocator, written, .{});
+        defer parsed.deinit();
+
+        try testing.expectEqualStrings(parsed.value.scope, @tagName(.testing));
+        try testing.expectEqual(parsed.value.@"@l", .Debug);
+        try testing.expectEqualStrings(parsed.value.@"@m", "This is a log 0: yay");
+    }
+    // struct
+    {
+        defer client.reset();
+        const args = .{ .num = 0, .message = "yay" };
+
+        try client.writeLog(.debug, .testing, "This is a log {[num]d}: {[message]s}", args);
+        const Body = SeqBody(@TypeOf(args));
+
+        const written: []const u8 = std.mem.sliceTo(client.bytes.written(), 0);
+        const parsed: json.Parsed(Body) = try json.parseFromSlice(Body, testing.allocator, written, .{});
+        defer parsed.deinit();
+
+        try testing.expectEqualStrings(parsed.value.scope, @tagName(.testing));
+        try testing.expectEqual(parsed.value.@"@l", .Debug);
+        try testing.expectEqualStrings(parsed.value.@"@m", "This is a log 0: yay");
+        try testing.expectEqualStrings(parsed.value.num, std.fmt.comptimePrint("{d}", .{args.num}));
+        try testing.expectEqualStrings(parsed.value.message, args.message);
+    }
+    // struct with repeated fields
+    {
+        defer client.reset();
+        const args = .{ .num = 0, .message = "yay" };
+
+        try client.writeLog(.debug, .testing, "This is a log {[num]d}{[num]d}: {[message]s}", args);
+        const Body = SeqBody(@TypeOf(args));
+
+        const written: []const u8 = std.mem.sliceTo(client.bytes.written(), 0);
+        const parsed: json.Parsed(Body) = try json.parseFromSlice(Body, testing.allocator, written, .{});
+        defer parsed.deinit();
+
+        try testing.expectEqualStrings(parsed.value.scope, @tagName(.testing));
+        try testing.expectEqual(parsed.value.@"@l", .Debug);
+        try testing.expectEqualStrings(parsed.value.@"@m", "This is a log 00: yay");
+        try testing.expectEqualStrings(parsed.value.num, std.fmt.comptimePrint("{d}", .{args.num}));
+        try testing.expectEqualStrings(parsed.value.message, args.message);
+    }
+    // struct with repeated fields (different specifiers on the same field)
+    {
+        defer client.reset();
+        const args = .{ .num = 0, .message = "yay" };
+
+        try client.writeLog(.debug, .testing, "This is a log {[num]d} {[num]d:0>4}: {[message]s}", args);
+        const Body = SeqBody(@TypeOf(args));
+
+        const written: []const u8 = std.mem.sliceTo(client.bytes.written(), 0);
+        const parsed: json.Parsed(Body) = try json.parseFromSlice(Body, testing.allocator, written, .{});
+        defer parsed.deinit();
+
+        try testing.expectEqualStrings(parsed.value.scope, @tagName(.testing));
+        try testing.expectEqual(parsed.value.@"@l", .Debug);
+        try testing.expectEqualStrings(parsed.value.@"@m", "This is a log 0 0000: yay");
+        try testing.expectEqualStrings(parsed.value.num, std.fmt.comptimePrint("{d}", .{args.num}));
+        try testing.expectEqualStrings(parsed.value.message, args.message);
+    }
 }
 
 const std = @import("std");
@@ -350,6 +446,7 @@ const util = @import("util.zig");
 const Io = std.Io;
 const debug = std.debug;
 const json = std.json;
+const testing = std.testing;
 const Thread = std.Thread;
 const Mutex = Thread.Mutex;
 const Atomic = std.atomic.Value;
