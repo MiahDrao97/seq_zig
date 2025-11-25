@@ -134,6 +134,8 @@ const SeqClient = struct {
         specifier: []const u8,
     };
 
+    const Error = HttpClient.ConnectError || HttpRequest.ReceiveHeadError || std.http.Reader.BodyError || error{NonSuccessResponse};
+
     fn init(gpa: Allocator, config: SeqConfig) (Allocator.Error || Stopwatch.Error)!SeqClient {
         return .{
             .bytes = try .initCapacity(gpa, config.log_capacity * 2),
@@ -152,11 +154,9 @@ const SeqClient = struct {
         comptime log: []const u8,
         args: anytype,
     ) Allocator.Error!void {
-        var date_time_buf: [24]u8 = undefined;
-
-        var seq_payload: SeqBody(@TypeOf(args)) = undefined;
+        const ArgsType = @TypeOf(args);
+        var seq_payload: SeqBody(ArgsType) = undefined;
         seq_payload.scope = @tagName(scope);
-        seq_payload.@"@t" = util.utcNowAsIsoString(&date_time_buf); // timestamp
         seq_payload.@"@l" = switch (level) { // log level
             .debug => .Debug,
             .info => .Information,
@@ -164,10 +164,12 @@ const SeqClient = struct {
             .err => .Error,
         };
 
+        var date_time_buf: [24]u8 = undefined;
+        seq_payload.@"@t" = util.utcNowAsIsoString(&date_time_buf); // timestamp
+
         var arena: ArenaAllocator = .init(self.bytes.allocator);
         defer arena.deinit();
 
-        const ArgsType = @TypeOf(args);
         if (!@typeInfo(ArgsType).@"struct".is_tuple) {
             const params: [@typeInfo(ArgsType).@"struct".fields.len]ParamsAndSpecifiers = parametersAndSpecifiers(log, ArgsType);
             inline for (&params) |p| {
@@ -251,7 +253,7 @@ const SeqClient = struct {
         return result;
     }
 
-    fn evaluate(self: *SeqClient) HttpClient.RequestError!void {
+    fn evaluate(self: *SeqClient) Error!void {
         // returns nanoseconds elapsed
         const ms: u64 = @trunc(
             @as(f64, @floatFromInt(self.sw.read())) / 1_000_000.0,
@@ -263,7 +265,7 @@ const SeqClient = struct {
         }
     }
 
-    fn flush(self: *SeqClient) HttpClient.RequestError!void {
+    fn flush(self: *SeqClient) Error!void {
         self.mutex.lock();
         defer self.mutex.unlock();
 
@@ -275,8 +277,23 @@ const SeqClient = struct {
             });
             defer request.deinit();
 
-            _ = try request.sendBody(entry);
-            // TODO : report error responses from server
+            try request.sendBodyComplete(entry);
+            var response: HttpResponse = try request.receiveHead(&.{});
+            if (response.head.status.class() != .success) {
+                var buf: [2048]u8 = undefined;
+                const reader: *Io.Reader = response.reader(&buf);
+
+                var stream: Io.Writer.Allocating = .init(self.bytes.allocator);
+                defer stream.deinit();
+
+                _ = reader.stream(&stream.writer, .unlimited) catch |err| switch (err) {
+                    Io.Reader.StreamError.ReadFailed => return response.bodyErr().?,
+                    Io.Reader.StreamError.WriteFailed => return error.OutOfMemory,
+                    Io.Reader.StreamError.EndOfStream => {},
+                };
+                debug.print("Seq server responded with non-success code {d}: {s}\n", .{ response.head.status, stream.written() });
+                return error.NonSuccessResponse;
+            }
         }
         self.reset();
     }
@@ -456,6 +473,7 @@ const ArrayList = std.ArrayList;
 const Uri = std.Uri;
 const HttpClient = std.http.Client;
 const HttpRequest = HttpClient.Request;
+const HttpResponse = HttpClient.Response;
 const Stopwatch = std.time.Timer;
 const StructField = std.builtin.Type.StructField;
 const LogLevel = std.log.Level;
