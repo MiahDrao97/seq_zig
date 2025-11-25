@@ -109,7 +109,7 @@ pub fn seqLogFn(
     defaultStdErr(level, scope, log, args);
 
     var root = @import("root");
-    if (comptime @hasField(@TypeOf(root), SeqBackgroundWorker.root_decl_name) and
+    if (comptime @hasDecl(@TypeOf(root), SeqBackgroundWorker.root_decl_name) and
         @TypeOf(@field(root, SeqBackgroundWorker.root_decl_name)) == SeqBackgroundWorker)
     {
         const background_worker: *SeqBackgroundWorker = &@field(root, SeqBackgroundWorker.root_decl_name);
@@ -160,7 +160,7 @@ const SeqClient = struct {
         var date_time_buf: [24]u8 = undefined;
 
         var seq_payload: SeqBody(ArgsType) = undefined;
-        seq_payload.Context = scope;
+        seq_payload.scope = scope;
         seq_payload.@"@t" = util.utcNowAsIsoString(&date_time_buf); // timestamp
         seq_payload.@"@l" = switch (level) { // log level
             .debug => .Debug,
@@ -209,7 +209,6 @@ const SeqClient = struct {
                         defer {
                             arg_name_len = 0;
                             specifier_len = 0;
-                            _ = arena.reset(.retain_capacity);
                         }
                         const arg_name: []const u8 = log[begin_arg_name..][0..arg_name_len];
                         const specifier: []const u8 = log[begin_specifier..][0..specifier_len];
@@ -327,7 +326,7 @@ fn SeqBody(comptime TBody: type) type {
                     .is_comptime = false,
                 },
                 .{
-                    .name = "Context",
+                    .name = "scope",
                     .type = []const u8,
                     .default_value_ptr = "",
                     .alignment = 0,
