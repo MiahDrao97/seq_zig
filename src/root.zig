@@ -85,7 +85,7 @@ pub const SeqBackgroundWorker = struct {
                 debug.print("FATAL: SeqBackgroundWorker ran out of memory. Returning from background thread...", .{@errorReturnTrace()});
                 return;
             },
-            // just swallow all other errors
+            // any others that should kill the background thread?
             else => debug.print("ERROR: SeqBackgroundWorker encountered the following error: {t} -> {?f}", .{ err, @errorReturnTrace() }),
         };
 
@@ -108,11 +108,11 @@ pub fn seqLogFn(
     // still write to std err no matter what
     defaultStdErr(level, scope, log, args);
 
-    var root = @import("root");
+    const root = @import("root");
     if (comptime @hasDecl(@TypeOf(root), SeqBackgroundWorker.root_decl_name) and
         @TypeOf(@field(root, SeqBackgroundWorker.root_decl_name)) == SeqBackgroundWorker)
     {
-        const background_worker: *SeqBackgroundWorker = &@field(root, SeqBackgroundWorker.root_decl_name);
+        const background_worker: *SeqBackgroundWorker = &root.seq_background_worker;
         background_worker.client.writeLog(level, scope, log, args) catch {
             debug.print("FATAL: SeqBackgroundWorker ran out of memory. Killing background thread...", .{@errorReturnTrace()});
             // kill the background worker
@@ -205,50 +205,53 @@ const SeqClient = struct {
         }
     }
 
-    inline fn parametersAndSpecifiers(
+    fn parametersAndSpecifiers(
         comptime log: []const u8,
         comptime TArgs: type,
     ) [@typeInfo(TArgs).@"struct".fields.len]ParamsAndSpecifiers {
-        comptime var result: [@typeInfo(TArgs).@"struct".fields.len]ParamsAndSpecifiers = undefined;
-        comptime var idx: usize = 0;
-        comptime var begin_arg_name: usize = undefined;
-        comptime var begin_specifier: usize = undefined;
-        comptime var arg_name_len: usize = 0;
-        comptime var specifier_len: usize = 0;
-        comptime var state: enum { begin_field, arg_name, specifier, none } = .none;
-        comptime outer: for (log, 0..) |char, i| switch (state) {
-            .none => if (char == '{') {
-                state = .begin_field;
-            },
-            .begin_field => {
-                debug.assert(char == '[' and i + 1 < log.len); // should be checked by comptime
-                begin_arg_name = i + 1;
-                state = .arg_name;
-            },
-            .arg_name => {
-                if (char == ']') {
-                    begin_specifier = i + 1;
-                    state = .specifier;
-                } else arg_name_len += 1;
-            },
-            .specifier => {
-                if (char == '}') {
-                    defer {
-                        arg_name_len = 0;
-                        specifier_len = 0;
-                        state = .none;
-                    }
-                    const arg_name: []const u8 = log[begin_arg_name..][0..arg_name_len];
-                    const specifier: []const u8 = log[begin_specifier..][0..specifier_len];
-                    for (0..idx) |j| {
-                        if (std.mem.eql(u8, arg_name, result[j].param)) continue :outer;
-                    }
-                    result[idx] = .{ .param = arg_name, .specifier = specifier };
-                    idx += 1;
-                } else specifier_len += 1;
-            },
-        };
-        return result;
+        comptime {
+            var result: [@typeInfo(TArgs).@"struct".fields.len]ParamsAndSpecifiers = undefined;
+            var idx: usize = 0;
+            var begin_arg_name: usize = undefined;
+            var begin_specifier: usize = undefined;
+            var arg_name_len: usize = 0;
+            var specifier_len: usize = 0;
+            var state: enum { begin_field, arg_name, specifier, none } = .none;
+
+            outer: for (log, 0..) |char, i| switch (state) {
+                .none => if (char == '{') {
+                    state = .begin_field;
+                },
+                .begin_field => {
+                    debug.assert(char == '[' and i + 1 < log.len); // should be checked by comptime
+                    begin_arg_name = i + 1;
+                    state = .arg_name;
+                },
+                .arg_name => {
+                    if (char == ']') {
+                        begin_specifier = i + 1;
+                        state = .specifier;
+                    } else arg_name_len += 1;
+                },
+                .specifier => {
+                    if (char == '}') {
+                        defer {
+                            arg_name_len = 0;
+                            specifier_len = 0;
+                            state = .none;
+                        }
+                        const arg_name: []const u8 = log[begin_arg_name..][0..arg_name_len];
+                        const specifier: []const u8 = log[begin_specifier..][0..specifier_len];
+                        for (0..idx) |j| {
+                            if (std.mem.eql(u8, arg_name, result[j].param)) continue :outer;
+                        }
+                        result[idx] = .{ .param = arg_name, .specifier = specifier };
+                        idx += 1;
+                    } else specifier_len += 1;
+                },
+            };
+            return result;
+        }
     }
 
     fn evaluate(self: *SeqClient) Error!void {
