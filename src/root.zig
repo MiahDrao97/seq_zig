@@ -307,6 +307,96 @@ const SeqClient = struct {
         self.indices.deinit(gpa);
         self.* = undefined;
     }
+
+    test writeLog {
+        var client: SeqClient = try .init(testing.allocator, .{ .url = undefined, .api_key = "" });
+        defer client.deinit(testing.allocator);
+
+        // empty args
+        {
+            defer client.reset();
+
+            try client.writeLog(.debug, .testing, "This is a log", .{});
+            const Body = SeqBody(@TypeOf(.{}));
+
+            const written: []const u8 = std.mem.sliceTo(client.bytes.written(), 0);
+            const parsed: json.Parsed(Body) = try json.parseFromSlice(Body, testing.allocator, written, .{});
+            defer parsed.deinit();
+
+            try testing.expectEqualStrings(parsed.value.scope, @tagName(.testing));
+            try testing.expectEqual(parsed.value.@"@l", .Debug);
+            try testing.expectEqualStrings(parsed.value.@"@m", "This is a log");
+        }
+        // tuple
+        {
+            defer client.reset();
+
+            try client.writeLog(.debug, .testing, "This is a log {d}: {s}", .{ 0, "yay" });
+            const Body = SeqBody(@TypeOf(.{}));
+
+            const written: []const u8 = std.mem.sliceTo(client.bytes.written(), 0);
+            const parsed: json.Parsed(Body) = try json.parseFromSlice(Body, testing.allocator, written, .{});
+            defer parsed.deinit();
+
+            try testing.expectEqualStrings(parsed.value.scope, @tagName(.testing));
+            try testing.expectEqual(parsed.value.@"@l", .Debug);
+            try testing.expectEqualStrings(parsed.value.@"@m", "This is a log 0: yay");
+        }
+        // struct
+        {
+            defer client.reset();
+            const args = .{ .num = 0, .message = "yay" };
+
+            try client.writeLog(.debug, .testing, "This is a log {[num]d}: {[message]s}", args);
+            const Body = SeqBody(@TypeOf(args));
+
+            const written: []const u8 = std.mem.sliceTo(client.bytes.written(), 0);
+            const parsed: json.Parsed(Body) = try json.parseFromSlice(Body, testing.allocator, written, .{});
+            defer parsed.deinit();
+
+            try testing.expectEqualStrings(parsed.value.scope, @tagName(.testing));
+            try testing.expectEqual(parsed.value.@"@l", .Debug);
+            try testing.expectEqualStrings(parsed.value.@"@m", "This is a log 0: yay");
+            try testing.expectEqualStrings(parsed.value.num, std.fmt.comptimePrint("{d}", .{args.num}));
+            try testing.expectEqualStrings(parsed.value.message, args.message);
+        }
+        // struct with repeated fields
+        {
+            defer client.reset();
+            const args = .{ .num = 0, .message = "yay" };
+
+            try client.writeLog(.debug, .testing, "This is a log {[num]d}{[num]d}: {[message]s}", args);
+            const Body = SeqBody(@TypeOf(args));
+
+            const written: []const u8 = std.mem.sliceTo(client.bytes.written(), 0);
+            const parsed: json.Parsed(Body) = try json.parseFromSlice(Body, testing.allocator, written, .{});
+            defer parsed.deinit();
+
+            try testing.expectEqualStrings(parsed.value.scope, @tagName(.testing));
+            try testing.expectEqual(parsed.value.@"@l", .Debug);
+            try testing.expectEqualStrings(parsed.value.@"@m", "This is a log 00: yay");
+            try testing.expectEqualStrings(parsed.value.num, std.fmt.comptimePrint("{d}", .{args.num}));
+            try testing.expectEqualStrings(parsed.value.message, args.message);
+        }
+        // struct with repeated fields (different specifiers on the same field)
+        {
+            defer client.reset();
+            const args = .{ .num = 0, .message = "yay" };
+
+            try client.writeLog(.debug, .testing, "This is a log {[num]d} {[num]d:0>4}: {[message]s}", args);
+            const Body = SeqBody(@TypeOf(args));
+
+            const written: []const u8 = std.mem.sliceTo(client.bytes.written(), 0);
+            const parsed: json.Parsed(Body) = try json.parseFromSlice(Body, testing.allocator, written, .{});
+            defer parsed.deinit();
+
+            try testing.expectEqualStrings(parsed.value.scope, @tagName(.testing));
+            try testing.expectEqual(parsed.value.@"@l", .Debug);
+            try testing.expectEqualStrings(parsed.value.@"@m", "This is a log 0 0000: yay");
+            try testing.expectEqualStrings(parsed.value.num, std.fmt.comptimePrint("{d}", .{args.num}));
+            try testing.expectEqualStrings(parsed.value.message, args.message);
+        }
+    }
 };
 
 const LogIndex = enum(u32) { _ };
@@ -364,96 +454,6 @@ fn SeqBody(comptime TBody: type) type {
             .layout = .auto,
         },
     }));
-}
-
-test "SeqClient.writeLog" {
-    var client: SeqClient = try .init(testing.allocator, .{ .url = undefined, .api_key = "" });
-    defer client.deinit(testing.allocator);
-
-    // empty args
-    {
-        defer client.reset();
-
-        try client.writeLog(.debug, .testing, "This is a log", .{});
-        const Body = SeqBody(@TypeOf(.{}));
-
-        const written: []const u8 = std.mem.sliceTo(client.bytes.written(), 0);
-        const parsed: json.Parsed(Body) = try json.parseFromSlice(Body, testing.allocator, written, .{});
-        defer parsed.deinit();
-
-        try testing.expectEqualStrings(parsed.value.scope, @tagName(.testing));
-        try testing.expectEqual(parsed.value.@"@l", .Debug);
-        try testing.expectEqualStrings(parsed.value.@"@m", "This is a log");
-    }
-    // tuple
-    {
-        defer client.reset();
-
-        try client.writeLog(.debug, .testing, "This is a log {d}: {s}", .{ 0, "yay" });
-        const Body = SeqBody(@TypeOf(.{}));
-
-        const written: []const u8 = std.mem.sliceTo(client.bytes.written(), 0);
-        const parsed: json.Parsed(Body) = try json.parseFromSlice(Body, testing.allocator, written, .{});
-        defer parsed.deinit();
-
-        try testing.expectEqualStrings(parsed.value.scope, @tagName(.testing));
-        try testing.expectEqual(parsed.value.@"@l", .Debug);
-        try testing.expectEqualStrings(parsed.value.@"@m", "This is a log 0: yay");
-    }
-    // struct
-    {
-        defer client.reset();
-        const args = .{ .num = 0, .message = "yay" };
-
-        try client.writeLog(.debug, .testing, "This is a log {[num]d}: {[message]s}", args);
-        const Body = SeqBody(@TypeOf(args));
-
-        const written: []const u8 = std.mem.sliceTo(client.bytes.written(), 0);
-        const parsed: json.Parsed(Body) = try json.parseFromSlice(Body, testing.allocator, written, .{});
-        defer parsed.deinit();
-
-        try testing.expectEqualStrings(parsed.value.scope, @tagName(.testing));
-        try testing.expectEqual(parsed.value.@"@l", .Debug);
-        try testing.expectEqualStrings(parsed.value.@"@m", "This is a log 0: yay");
-        try testing.expectEqualStrings(parsed.value.num, std.fmt.comptimePrint("{d}", .{args.num}));
-        try testing.expectEqualStrings(parsed.value.message, args.message);
-    }
-    // struct with repeated fields
-    {
-        defer client.reset();
-        const args = .{ .num = 0, .message = "yay" };
-
-        try client.writeLog(.debug, .testing, "This is a log {[num]d}{[num]d}: {[message]s}", args);
-        const Body = SeqBody(@TypeOf(args));
-
-        const written: []const u8 = std.mem.sliceTo(client.bytes.written(), 0);
-        const parsed: json.Parsed(Body) = try json.parseFromSlice(Body, testing.allocator, written, .{});
-        defer parsed.deinit();
-
-        try testing.expectEqualStrings(parsed.value.scope, @tagName(.testing));
-        try testing.expectEqual(parsed.value.@"@l", .Debug);
-        try testing.expectEqualStrings(parsed.value.@"@m", "This is a log 00: yay");
-        try testing.expectEqualStrings(parsed.value.num, std.fmt.comptimePrint("{d}", .{args.num}));
-        try testing.expectEqualStrings(parsed.value.message, args.message);
-    }
-    // struct with repeated fields (different specifiers on the same field)
-    {
-        defer client.reset();
-        const args = .{ .num = 0, .message = "yay" };
-
-        try client.writeLog(.debug, .testing, "This is a log {[num]d} {[num]d:0>4}: {[message]s}", args);
-        const Body = SeqBody(@TypeOf(args));
-
-        const written: []const u8 = std.mem.sliceTo(client.bytes.written(), 0);
-        const parsed: json.Parsed(Body) = try json.parseFromSlice(Body, testing.allocator, written, .{});
-        defer parsed.deinit();
-
-        try testing.expectEqualStrings(parsed.value.scope, @tagName(.testing));
-        try testing.expectEqual(parsed.value.@"@l", .Debug);
-        try testing.expectEqualStrings(parsed.value.@"@m", "This is a log 0 0000: yay");
-        try testing.expectEqualStrings(parsed.value.num, std.fmt.comptimePrint("{d}", .{args.num}));
-        try testing.expectEqualStrings(parsed.value.message, args.message);
-    }
 }
 
 const std = @import("std");
