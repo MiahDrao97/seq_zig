@@ -91,8 +91,10 @@ pub const SeqBackgroundWorker = struct {
 
         // received sig kill
         debug.print("Flushing Seq client...", .{});
-        self.client.flush() catch |err| debug.print("ERROR: Failed to flush Seq client on shutdown: {t} -> {?f}", .{ err, @errorReturnTrace() });
-        debug.print("Seq client successfully flushed all logs.", .{});
+        if (self.client.flush())
+            debug.print("Seq client successfully flushed all logs.", .{})
+        else |err|
+            debug.print("ERROR: Failed to flush Seq client on shutdown: {t} -> {?f}", .{ err, @errorReturnTrace() });
     }
 };
 
@@ -105,28 +107,35 @@ pub fn seqLogFn(
     comptime log: []const u8,
     args: anytype,
 ) void {
-    // still write to std err no matter what
-    defaultStdErr(level, scope, log, args);
-
     const root = @import("root");
     if (comptime @hasDecl(@TypeOf(root), SeqBackgroundWorker.root_decl_name) and
         @TypeOf(@field(root, SeqBackgroundWorker.root_decl_name)) == SeqBackgroundWorker)
     {
+        // still write to std err no matter what
+        defaultStdErr(level, scope, log, args);
+
         const background_worker: *SeqBackgroundWorker = &root.seq_background_worker;
         background_worker.client.writeLog(level, scope, log, args) catch {
             debug.print("FATAL: SeqBackgroundWorker ran out of memory. Killing background thread...", .{@errorReturnTrace()});
             // kill the background worker
             background_worker.sig_kill.store(true, .acq_rel);
         };
-    }
+    } else @compileError("Root source file does not declare a public global variable of type `" ++ @typeName(SeqBackgroundWorker) ++ "` named '" ++ SeqBackgroundWorker.root_decl_name ++ "'");
 }
 
+/// Client that interfaces with the Seq server
 const SeqClient = struct {
+    /// Interned JSON payloads to be sent to the Seq server
     bytes: Io.Writer.Allocating,
+    /// Offsets with the contiguous region of `bytes`, indicating the start of a new JSON payload until the next null byte
     indices: ArrayList(LogIndex),
+    /// Http client
     connection: HttpClient,
+    /// Configuration
     config: SeqConfig,
+    /// Timer for determining if we've passed the flush interval
     sw: Stopwatch,
+    /// Mutex to ensure that writes and flushes do not interfere with one another
     mutex: Mutex,
 
     const ParamsAndSpecifiers = struct {
@@ -205,7 +214,7 @@ const SeqClient = struct {
         }
     }
 
-    fn parametersAndSpecifiers(
+    inline fn parametersAndSpecifiers(
         comptime log: []const u8,
         comptime TArgs: type,
     ) [@typeInfo(TArgs).@"struct".fields.len]ParamsAndSpecifiers {
@@ -302,6 +311,7 @@ const SeqClient = struct {
     fn reset(self: *SeqClient) void {
         self.bytes.clearRetainingCapacity();
         self.indices.clearRetainingCapacity();
+        self.sw.reset();
     }
 
     fn deinit(self: *SeqClient, gpa: Allocator) void {
@@ -457,6 +467,11 @@ fn SeqBody(comptime TBody: type) type {
             .layout = .auto,
         },
     }));
+}
+
+comptime {
+    // unit-test non-pub structs
+    _ = SeqClient;
 }
 
 const std = @import("std");
