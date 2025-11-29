@@ -66,7 +66,7 @@ pub const SeqBackgroundWorker = struct {
     /// For a clean shutdown, this sends a kill signal to the background thread.
     /// Flushes all logs on shutdown.
     pub fn shutdown(self: *SeqBackgroundWorker) void {
-        self.sig_kill.store(true, .acq_rel);
+        self.sig_kill.store(true, .seq_cst);
         self.thread.join();
         // client is created and cleaned up in the background thread; don't want to attempt to deinit() something that could be undefined
         self.* = undefined;
@@ -82,7 +82,7 @@ pub const SeqBackgroundWorker = struct {
 
         while (!self.sig_kill.load(.monotonic)) self.client.evaluate() catch |err| switch (err) {
             Allocator.Error.OutOfMemory => {
-                debug.print("FATAL: SeqBackgroundWorker ran out of memory. Returning from background thread...", .{@errorReturnTrace()});
+                debug.print("FATAL: SeqBackgroundWorker ran out of memory. Returning from background thread...\n{?f}", .{@errorReturnTrace()});
                 return;
             },
             // any others that should kill the background thread?
@@ -108,7 +108,7 @@ pub fn seqLogFn(
     args: anytype,
 ) void {
     const root = @import("root");
-    if (comptime @hasDecl(@TypeOf(root), SeqBackgroundWorker.root_decl_name) and
+    if (comptime @hasDecl(root, SeqBackgroundWorker.root_decl_name) and
         @TypeOf(@field(root, SeqBackgroundWorker.root_decl_name)) == SeqBackgroundWorker)
     {
         // still write to std err no matter what
@@ -116,9 +116,9 @@ pub fn seqLogFn(
 
         const background_worker: *SeqBackgroundWorker = &root.seq_background_worker;
         background_worker.client.writeLog(level, scope, log, args) catch {
-            debug.print("FATAL: SeqBackgroundWorker ran out of memory. Killing background thread...", .{@errorReturnTrace()});
+            debug.print("FATAL: SeqBackgroundWorker ran out of memory. Killing background thread...\n{?f}", .{@errorReturnTrace()});
             // kill the background worker
-            background_worker.sig_kill.store(true, .acq_rel);
+            background_worker.sig_kill.store(true, .seq_cst);
         };
     } else @compileError("Root source file does not declare a public global variable of type `" ++ @typeName(SeqBackgroundWorker) ++ "` named '" ++ SeqBackgroundWorker.root_decl_name ++ "'");
 }
@@ -265,8 +265,10 @@ const SeqClient = struct {
 
     fn evaluate(self: *SeqClient) Error!void {
         // returns nanoseconds elapsed
-        const ms: u64 = @trunc(
-            @as(f64, @floatFromInt(self.sw.read())) / 1_000_000.0,
+        const ms: u64 = @intFromFloat(
+            @trunc(
+                @as(f64, @floatFromInt(self.sw.read())) / 1_000_000.0,
+            ),
         );
         if (ms >= self.config.flush_interval_ms or
             self.bytes.written().len >= self.config.log_capacity)
@@ -283,7 +285,9 @@ const SeqClient = struct {
             // these should be the JSON bodies prepared to be sent
             const entry: []u8 = std.mem.sliceTo(self.bytes.written()[@intFromEnum(idx)..], 0);
             var request: HttpRequest = try self.connection.request(.POST, self.config.url, .{
-                .headers = .{ .authorization = self.config.api_key },
+                .headers = .{
+                    .authorization = .{ .override = self.config.api_key },
+                },
             });
             defer request.deinit();
 
