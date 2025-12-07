@@ -44,17 +44,26 @@ pub const SeqBackgroundWorker = struct {
     thread: Thread,
     /// Seq client
     client: SeqClient,
-    /// Kill signal
-    sig_kill: Atomic(bool),
+    /// Signal controlling the state of the background worker
+    signal: Atomic(Signal),
 
     /// Expected field name of the mutable global variable that handles the background process of sending logs to Seq.
     pub const root_decl_name = "seq_background_worker";
+
+    const Signal = enum(u8) {
+        /// Not running yet; some fields remain unitialized, and it wouldn't be safe to write logs yet
+        staged,
+        /// All fields initialized, and we can safely record logs
+        running,
+        /// The kill signal is set
+        stopped,
+    };
 
     /// This initialized value is inert, leaving the background thread and client undefined
     pub const init: SeqBackgroundWorker = .{
         .thread = undefined,
         .client = undefined,
-        .sig_kill = .init(false),
+        .signal = .init(.staged),
     };
 
     /// Start the seq client.
@@ -66,7 +75,7 @@ pub const SeqBackgroundWorker = struct {
     /// For a clean shutdown, this sends a kill signal to the background thread.
     /// Flushes all logs on shutdown.
     pub fn shutdown(self: *SeqBackgroundWorker) void {
-        self.sig_kill.store(true, .seq_cst);
+        self.signal.store(.stopped, .seq_cst);
         self.thread.join();
         // client is created and cleaned up in the background thread; don't want to attempt to deinit() something that could be undefined
         self.* = undefined;
@@ -76,11 +85,14 @@ pub const SeqBackgroundWorker = struct {
         self.client = SeqClient.init(gpa, config) catch |err| {
             // assuming that we hijacked the log function, so we're going straight to std err
             debug.print("FATAL: SeqBackgroundWorker cannot start: {t} -> {?f}\n", .{ err, @errorReturnTrace() });
+            self.signal.store(.stopped, .seq_cst);
             return;
         };
         defer self.client.deinit(gpa);
 
-        while (!self.sig_kill.load(.monotonic)) self.client.evaluate() catch |err| switch (err) {
+        // everything is initialized!
+        self.signal.store(.running, .seq_cst);
+        while (self.signal.load(.monotonic) == .running) self.client.evaluate() catch |err| switch (err) {
             Allocator.Error.OutOfMemory => {
                 debug.print("FATAL: SeqBackgroundWorker ran out of memory. Returning from background thread...\n{?f}", .{@errorReturnTrace()});
                 return;
@@ -115,10 +127,18 @@ pub fn seqLogFn(
         defaultStdErr(level, scope, log, args);
 
         const background_worker: *SeqBackgroundWorker = &root.seq_background_worker;
+        // ensure that everything is initialized before proceeding
+        while (switch (background_worker.signal.load(.monotonic)) {
+            .staged => true,
+            else => false,
+        }) {
+            // spin...
+        }
+
         background_worker.client.writeLog(level, scope, log, args) catch {
             debug.print("FATAL: SeqBackgroundWorker ran out of memory. Killing background thread...\n{?f}", .{@errorReturnTrace()});
             // kill the background worker
-            background_worker.sig_kill.store(true, .seq_cst);
+            background_worker.signal.store(.stopped, .seq_cst);
         };
     } else @compileError("Root source file does not declare a public global variable of type `" ++ @typeName(SeqBackgroundWorker) ++ "` named '" ++ SeqBackgroundWorker.root_decl_name ++ "'");
 }
@@ -129,13 +149,15 @@ const SeqClient = struct {
     bytes: Io.Writer.Allocating,
     /// Offsets with the contiguous region of `bytes`, indicating the start of a new JSON payload until the next null byte
     indices: ArrayList(LogIndex),
+    /// Arena for scratch space as needed
+    arena: ArenaAllocator,
     /// Http client
     connection: HttpClient,
     /// Configuration
     config: SeqConfig,
     /// Timer for determining if we've passed the flush interval
     sw: Stopwatch,
-    /// Mutex to ensure that writes and flushes do not interfere with one another
+    /// Mutex to ensure that writes and flushes do not interfere with one another (ref to the mutex in the background worker)
     mutex: Mutex,
 
     const ParamsAndSpecifiers = struct {
@@ -149,6 +171,7 @@ const SeqClient = struct {
         return .{
             .bytes = try .initCapacity(gpa, config.log_capacity * 2),
             .indices = try .initCapacity(gpa, @divTrunc(config.log_capacity, 2)),
+            .arena = .init(gpa),
             .connection = .{ .allocator = gpa },
             .config = config,
             .sw = try .start(),
@@ -176,21 +199,19 @@ const SeqClient = struct {
         var date_time_buf: [24]u8 = undefined;
         seq_payload.@"@t" = util.utcNowAsIsoString(&date_time_buf); // timestamp
 
-        var arena: ArenaAllocator = .init(self.bytes.allocator);
-        defer arena.deinit();
-
+        defer _ = self.arena.reset(.retain_capacity);
         if (!@typeInfo(ArgsType).@"struct".is_tuple) {
             // copy fields from args struct, which then become parameterized values given to Seq
             const params: [@typeInfo(ArgsType).@"struct".fields.len]ParamsAndSpecifiers = parametersAndSpecifiers(log, ArgsType);
             inline for (&params) |p| {
-                var stream: Io.Writer.Allocating = .init(arena.allocator());
+                var stream: Io.Writer.Allocating = .init(self.arena.allocator());
                 stream.writer.print("{" ++ p.specifier ++ "}", .{@field(args, p.param)}) catch return error.OutOfMemory;
                 @field(seq_payload, p.param) = stream.written();
             }
         }
 
         // very unlikely that we'll allocate any more than this, but it's technically possible, so I don't trust a stack buffer
-        var message_stream: Io.Writer.Allocating = try .initCapacity(arena.allocator(), log.len);
+        var message_stream: Io.Writer.Allocating = try .initCapacity(self.arena.allocator(), log.len);
         message_stream.writer.print(log, args) catch return error.OutOfMemory;
         seq_payload.@"@m" = message_stream.written();
 
@@ -322,6 +343,7 @@ const SeqClient = struct {
         self.connection.deinit();
         self.bytes.deinit();
         self.indices.deinit(gpa);
+        self.arena.deinit();
         self.* = undefined;
     }
 
@@ -371,11 +393,11 @@ const SeqClient = struct {
             const parsed: json.Parsed(Body) = try json.parseFromSlice(Body, testing.allocator, written, .{});
             defer parsed.deinit();
 
-            try testing.expectEqualStrings(parsed.value.scope, @tagName(.testing));
-            try testing.expectEqual(parsed.value.@"@l", .Debug);
-            try testing.expectEqualStrings(parsed.value.@"@m", "This is a log 0: yay");
-            try testing.expectEqualStrings(parsed.value.num, std.fmt.comptimePrint("{d}", .{args.num}));
-            try testing.expectEqualStrings(parsed.value.message, args.message);
+            try testing.expectEqualStrings(@tagName(.testing), parsed.value.scope);
+            try testing.expectEqual(.Debug, parsed.value.@"@l");
+            try testing.expectEqualStrings("This is a log 0: yay", parsed.value.@"@m");
+            try testing.expectEqualStrings(std.fmt.comptimePrint("{d}", .{args.num}), parsed.value.num);
+            try testing.expectEqualStrings(args.message, parsed.value.message);
         }
         // struct with repeated fields
         {
@@ -389,11 +411,11 @@ const SeqClient = struct {
             const parsed: json.Parsed(Body) = try json.parseFromSlice(Body, testing.allocator, written, .{});
             defer parsed.deinit();
 
-            try testing.expectEqualStrings(parsed.value.scope, @tagName(.testing));
-            try testing.expectEqual(parsed.value.@"@l", .Debug);
-            try testing.expectEqualStrings(parsed.value.@"@m", "This is a log 00: yay");
-            try testing.expectEqualStrings(parsed.value.num, std.fmt.comptimePrint("{d}", .{args.num}));
-            try testing.expectEqualStrings(parsed.value.message, args.message);
+            try testing.expectEqualStrings(@tagName(.testing), parsed.value.scope);
+            try testing.expectEqual(.Debug, parsed.value.@"@l");
+            try testing.expectEqualStrings("This is a log 00: yay", parsed.value.@"@m");
+            try testing.expectEqualStrings(std.fmt.comptimePrint("{d}", .{args.num}), parsed.value.num);
+            try testing.expectEqualStrings(args.message, parsed.value.message);
         }
         // struct with repeated fields (different specifiers on the same field)
         {
@@ -407,11 +429,11 @@ const SeqClient = struct {
             const parsed: json.Parsed(Body) = try json.parseFromSlice(Body, testing.allocator, written, .{});
             defer parsed.deinit();
 
-            try testing.expectEqualStrings(parsed.value.scope, @tagName(.testing));
-            try testing.expectEqual(parsed.value.@"@l", .Debug);
-            try testing.expectEqualStrings(parsed.value.@"@m", "This is a log 0 0000: yay");
-            try testing.expectEqualStrings(parsed.value.num, std.fmt.comptimePrint("{d}", .{args.num}));
-            try testing.expectEqualStrings(parsed.value.message, args.message);
+            try testing.expectEqualStrings(@tagName(.testing), parsed.value.scope);
+            try testing.expectEqual(.Debug, parsed.value.@"@l");
+            try testing.expectEqualStrings("This is a log 0 0000: yay", parsed.value.@"@m");
+            try testing.expectEqualStrings(std.fmt.comptimePrint("{d}", .{args.num}), parsed.value.num);
+            try testing.expectEqualStrings(args.message, parsed.value.message);
         }
     }
 };
