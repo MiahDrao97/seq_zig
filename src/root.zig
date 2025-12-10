@@ -93,20 +93,23 @@ pub const SeqBackgroundWorker = struct {
         // everything is initialized!
         self.signal.store(.running, .seq_cst);
         while (self.signal.load(.monotonic) == .running) self.client.evaluate() catch |err| switch (err) {
-            Allocator.Error.OutOfMemory => {
-                debug.print("FATAL: SeqBackgroundWorker ran out of memory. Returning from background thread...\n{?f}", .{@errorReturnTrace()});
+            // any others that should kill the background thread?
+            Allocator.Error.OutOfMemory, error.ConnectionRefused => |e| {
+                debug.print("FATAL: SeqBackgroundWorker encountered unrecoverable error: {t}. Returning from background thread...\n{?f}\n", .{
+                    e,
+                    @errorReturnTrace(),
+                });
                 return;
             },
-            // any others that should kill the background thread?
-            else => debug.print("ERROR: SeqBackgroundWorker encountered the following error: {t} -> {?f}", .{ err, @errorReturnTrace() }),
+            else => debug.print("ERROR: SeqBackgroundWorker encountered the following error: {t} -> {?f}\n", .{ err, @errorReturnTrace() }),
         };
 
         // received sig kill
-        debug.print("Flushing Seq client...", .{});
+        debug.print("Flushing Seq client...\n", .{});
         if (self.client.flush())
-            debug.print("Seq client successfully flushed all logs.", .{})
+            debug.print("Seq client successfully flushed all logs.\n", .{})
         else |err|
-            debug.print("ERROR: Failed to flush Seq client on shutdown: {t} -> {?f}", .{ err, @errorReturnTrace() });
+            debug.print("ERROR: Failed to flush Seq client on shutdown: {t} -> {?f}\n", .{ err, @errorReturnTrace() });
     }
 };
 
@@ -130,7 +133,8 @@ pub fn seqLogFn(
         // ensure that everything is initialized before proceeding
         while (switch (background_worker.signal.load(.monotonic)) {
             .staged => true,
-            else => false,
+            .running => false,
+            .stopped => return,
         }) {
             // spin...
         }
@@ -156,7 +160,7 @@ const SeqClient = struct {
     /// Configuration
     config: SeqConfig,
     /// Timer for determining if we've passed the flush interval
-    sw: Stopwatch,
+    timer: Timer,
     /// Mutex to ensure that writes and flushes do not interfere with one another (ref to the mutex in the background worker)
     mutex: Mutex,
 
@@ -167,14 +171,14 @@ const SeqClient = struct {
 
     const Error = HttpClient.ConnectError || HttpRequest.ReceiveHeadError || std.http.Reader.BodyError || error{NonSuccessResponse};
 
-    fn init(gpa: Allocator, config: SeqConfig) (Allocator.Error || Stopwatch.Error)!SeqClient {
+    fn init(gpa: Allocator, config: SeqConfig) (Allocator.Error || Timer.Error)!SeqClient {
         return .{
             .bytes = try .initCapacity(gpa, config.log_capacity * 2),
             .indices = try .initCapacity(gpa, @divTrunc(config.log_capacity, 2)),
             .arena = .init(gpa),
             .connection = .{ .allocator = gpa },
             .config = config,
-            .sw = try .start(),
+            .timer = try .start(),
             .mutex = .{},
         };
     }
@@ -273,7 +277,7 @@ const SeqClient = struct {
                         const arg_name: []const u8 = log[begin_arg_name..][0..arg_name_len];
                         const specifier: []const u8 = log[begin_specifier..][0..specifier_len];
                         for (0..idx) |j| {
-                            if (std.mem.eql(u8, arg_name, result[j].param)) continue :outer;
+                            if (mem.eql(u8, arg_name, result[j].param)) continue :outer;
                         }
                         result[idx] = .{ .param = arg_name, .specifier = specifier };
                         idx += 1;
@@ -288,7 +292,7 @@ const SeqClient = struct {
         // returns nanoseconds elapsed
         const ms: u64 = @intFromFloat(
             @trunc(
-                @as(f64, @floatFromInt(self.sw.read())) / 1_000_000.0,
+                @as(f64, @floatFromInt(self.timer.read())) / 1_000_000.0,
             ),
         );
         if (ms >= self.config.flush_interval_ms or
@@ -304,7 +308,7 @@ const SeqClient = struct {
 
         for (self.indices.items) |idx| {
             // these should be the JSON bodies prepared to be sent
-            const entry: []u8 = std.mem.sliceTo(self.bytes.written()[@intFromEnum(idx)..], 0);
+            const entry: []u8 = mem.sliceTo(self.bytes.written()[@intFromEnum(idx)..], 0);
             var request: HttpRequest = try self.connection.request(.POST, self.config.url, .{
                 .headers = .{
                     .authorization = .{ .override = self.config.api_key },
@@ -336,7 +340,7 @@ const SeqClient = struct {
     fn reset(self: *SeqClient) void {
         self.bytes.clearRetainingCapacity();
         self.indices.clearRetainingCapacity();
-        self.sw.reset();
+        self.timer.reset();
     }
 
     fn deinit(self: *SeqClient, gpa: Allocator) void {
@@ -358,7 +362,7 @@ const SeqClient = struct {
             try client.writeLog(.debug, .testing, "This is a log", .{});
             const Body = SeqBody(@TypeOf(.{}));
 
-            const written: []const u8 = std.mem.sliceTo(client.bytes.written(), 0);
+            const written: []const u8 = mem.sliceTo(client.bytes.written(), 0);
             const parsed: json.Parsed(Body) = try json.parseFromSlice(Body, testing.allocator, written, .{});
             defer parsed.deinit();
 
@@ -373,7 +377,7 @@ const SeqClient = struct {
             try client.writeLog(.debug, .testing, "This is a log {d}: {s}", .{ 0, "yay" });
             const Body = SeqBody(@TypeOf(.{}));
 
-            const written: []const u8 = std.mem.sliceTo(client.bytes.written(), 0);
+            const written: []const u8 = mem.sliceTo(client.bytes.written(), 0);
             const parsed: json.Parsed(Body) = try json.parseFromSlice(Body, testing.allocator, written, .{});
             defer parsed.deinit();
 
@@ -389,7 +393,7 @@ const SeqClient = struct {
             try client.writeLog(.debug, .testing, "This is a log {[num]d}: {[message]s}", args);
             const Body = SeqBody(@TypeOf(args));
 
-            const written: []const u8 = std.mem.sliceTo(client.bytes.written(), 0);
+            const written: []const u8 = mem.sliceTo(client.bytes.written(), 0);
             const parsed: json.Parsed(Body) = try json.parseFromSlice(Body, testing.allocator, written, .{});
             defer parsed.deinit();
 
@@ -407,7 +411,7 @@ const SeqClient = struct {
             try client.writeLog(.debug, .testing, "This is a log {[num]d}{[num]d}: {[message]s}", args);
             const Body = SeqBody(@TypeOf(args));
 
-            const written: []const u8 = std.mem.sliceTo(client.bytes.written(), 0);
+            const written: []const u8 = mem.sliceTo(client.bytes.written(), 0);
             const parsed: json.Parsed(Body) = try json.parseFromSlice(Body, testing.allocator, written, .{});
             defer parsed.deinit();
 
@@ -425,7 +429,7 @@ const SeqClient = struct {
             try client.writeLog(.debug, .testing, "This is a log {[num]d} {[num]d:0>4}: {[message]s}", args);
             const Body = SeqBody(@TypeOf(args));
 
-            const written: []const u8 = std.mem.sliceTo(client.bytes.written(), 0);
+            const written: []const u8 = mem.sliceTo(client.bytes.written(), 0);
             const parsed: json.Parsed(Body) = try json.parseFromSlice(Body, testing.allocator, written, .{});
             defer parsed.deinit();
 
@@ -505,18 +509,19 @@ const util = @import("util.zig");
 const Io = std.Io;
 const debug = std.debug;
 const json = std.json;
+const mem = std.mem;
 const testing = std.testing;
 const Thread = std.Thread;
 const Mutex = Thread.Mutex;
 const Atomic = std.atomic.Value;
-const Allocator = std.mem.Allocator;
+const Allocator = mem.Allocator;
 const ArenaAllocator = std.heap.ArenaAllocator;
 const ArrayList = std.ArrayList;
 const Uri = std.Uri;
 const HttpClient = std.http.Client;
 const HttpRequest = HttpClient.Request;
 const HttpResponse = HttpClient.Response;
-const Stopwatch = std.time.Timer;
+const Timer = std.time.Timer;
 const StructField = std.builtin.Type.StructField;
 const LogLevel = std.log.Level;
 const defaultStdErr = std.log.defaultLog;
