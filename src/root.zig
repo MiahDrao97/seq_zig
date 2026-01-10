@@ -5,7 +5,6 @@
 //!
 //! ```zig
 //! // assuming imports...
-//! // assuming Allocator interface...
 //!
 //! // assign the `seqLogFn` to the `logFn`
 //! pub const std_options: std.Options = .{ .logFn = seqLogFn };
@@ -13,7 +12,9 @@
 //! pub var seq_background_worker: SeqBackgroundWorker = .init;
 //!
 //! pub fn main() !void {
-//!     try seq_background_worker.start(gpa, .{
+//!     // assuming Io and Allocator interfaces...
+//!
+//!     try seq_background_worker.start(io, gpa, .{
 //!         // fill these in for your Seq server url and API key...
 //!         .url = undefined,
 //!         .api_key = "",
