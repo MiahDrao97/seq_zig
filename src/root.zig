@@ -68,8 +68,8 @@ pub const SeqBackgroundWorker = struct {
 
     /// Start the seq client.
     /// `gpa` must be threadsafe.
-    pub fn start(self: *SeqBackgroundWorker, gpa: Allocator, config: SeqConfig) Thread.SpawnError!void {
-        self.thread = try .spawn(.{}, worker, .{ self, gpa, config });
+    pub fn start(self: *SeqBackgroundWorker, io: Io, gpa: Allocator, config: SeqConfig) Thread.SpawnError!void {
+        self.thread = try .spawn(.{}, worker, .{ self, io, gpa, config });
     }
 
     /// For a clean shutdown, this sends a kill signal to the background thread.
@@ -81,10 +81,11 @@ pub const SeqBackgroundWorker = struct {
         self.* = undefined;
     }
 
-    fn worker(self: *SeqBackgroundWorker, gpa: Allocator, config: SeqConfig) void {
-        self.client = SeqClient.init(gpa, config) catch |err| {
+    fn worker(self: *SeqBackgroundWorker, io: Io, gpa: Allocator, config: SeqConfig) void {
+        self.client = SeqClient.init(io, gpa, config) catch |err| {
+            if (@errorReturnTrace()) |t| debug.dumpStackTrace(t);
             // assuming that we hijacked the log function, so we're going straight to std err
-            debug.print("FATAL: SeqBackgroundWorker cannot start: {t} -> {?f}\n", .{ err, @errorReturnTrace() });
+            debug.print("FATAL: SeqBackgroundWorker cannot start: {t}\n", .{err});
             self.signal.store(.stopped, .seq_cst);
             return;
         };
@@ -92,24 +93,26 @@ pub const SeqBackgroundWorker = struct {
 
         // everything is initialized!
         self.signal.store(.running, .seq_cst);
-        while (self.signal.load(.monotonic) == .running) self.client.evaluate() catch |err| switch (err) {
-            // any others that should kill the background thread?
-            Allocator.Error.OutOfMemory, error.ConnectionRefused => |e| {
-                debug.print("FATAL: SeqBackgroundWorker encountered unrecoverable error: {t}. Returning from background thread...\n{?f}\n", .{
-                    e,
-                    @errorReturnTrace(),
-                });
-                return;
-            },
-            else => debug.print("ERROR: SeqBackgroundWorker encountered the following error: {t} -> {?f}\n", .{ err, @errorReturnTrace() }),
+        while (self.signal.load(.monotonic) == .running) self.client.evaluate() catch |err| {
+            if (@errorReturnTrace()) |t| debug.dumpStackTrace(t);
+            switch (err) {
+                // any others that should kill the background thread?
+                Allocator.Error.OutOfMemory, error.ConnectionRefused => |e| {
+                    debug.print("FATAL: SeqBackgroundWorker encountered unrecoverable error: {t}. Returning from background thread...\n", .{e});
+                    return;
+                },
+                else => debug.print("ERROR: SeqBackgroundWorker encountered the following error: {t}\n", .{err}),
+            }
         };
 
         // received sig kill
         debug.print("Flushing Seq client...\n", .{});
         if (self.client.flush())
             debug.print("Seq client successfully flushed all logs.\n", .{})
-        else |err|
-            debug.print("ERROR: Failed to flush Seq client on shutdown: {t} -> {?f}\n", .{ err, @errorReturnTrace() });
+        else |err| {
+            if (@errorReturnTrace()) |t| debug.dumpStackTrace(t);
+            debug.print("ERROR: Failed to flush Seq client on shutdown: {t}\n", .{err});
+        }
     }
 };
 
@@ -118,7 +121,7 @@ pub const SeqBackgroundWorker = struct {
 /// If that doesn't exist, then only the default log written to STDERR occurs.
 pub fn seqLogFn(
     comptime level: LogLevel,
-    comptime scope: @Type(.enum_literal),
+    comptime scope: @EnumLiteral(),
     comptime log: []const u8,
     args: anytype,
 ) void {
@@ -139,8 +142,13 @@ pub fn seqLogFn(
             // spin...
         }
 
-        background_worker.client.writeLog(level, scope, log, args) catch {
-            debug.print("FATAL: SeqBackgroundWorker ran out of memory. Killing background thread...\n{?f}", .{@errorReturnTrace()});
+        background_worker.client.writeLog(level, scope, log, args) catch |err| {
+            if (@errorReturnTrace()) |t| debug.dumpStackTrace(t);
+            switch (err) {
+                Allocator.Error.OutOfMemory => debug.print("FATAL: SeqBackgroundWorker ran out of memory. Killing background thread...\n", .{}),
+                Io.Clock.Error.UnsupportedClock => debug.print("FATAL: Clock not supported. Killing background thread...\n", .{}),
+                Io.Clock.Error.Unexpected => return debug.print("ERROR: SeqBackgroundWorker encountered unexpected error while getting current time.\n", .{}),
+            }
             // kill the background worker
             background_worker.signal.store(.stopped, .seq_cst);
         };
@@ -171,12 +179,12 @@ const SeqClient = struct {
 
     const Error = HttpClient.ConnectError || HttpRequest.ReceiveHeadError || std.http.Reader.BodyError || error{NonSuccessResponse};
 
-    fn init(gpa: Allocator, config: SeqConfig) (Allocator.Error || Timer.Error)!SeqClient {
+    fn init(io: Io, gpa: Allocator, config: SeqConfig) (Allocator.Error || Timer.Error)!SeqClient {
         return .{
             .bytes = try .initCapacity(gpa, config.log_capacity * 2),
             .indices = try .initCapacity(gpa, @divTrunc(config.log_capacity, 2)),
             .arena = .init(gpa),
-            .connection = .{ .allocator = gpa },
+            .connection = .{ .io = io, .allocator = gpa },
             .config = config,
             .timer = try .start(),
             .mutex = .{},
@@ -186,10 +194,10 @@ const SeqClient = struct {
     fn writeLog(
         self: *SeqClient,
         comptime level: LogLevel,
-        comptime scope: @Type(.enum_literal),
+        comptime scope: @EnumLiteral(),
         comptime log: []const u8,
         args: anytype,
-    ) Allocator.Error!void {
+    ) (Allocator.Error || Io.Clock.Error)!void {
         const ArgsType = @TypeOf(args);
         var seq_payload: SeqBody(ArgsType) = undefined;
         seq_payload.scope = @tagName(scope);
@@ -201,7 +209,7 @@ const SeqClient = struct {
         };
 
         var date_time_buf: [24]u8 = undefined;
-        seq_payload.@"@t" = util.utcNowAsIsoString(&date_time_buf); // timestamp
+        seq_payload.@"@t" = try util.utcNowAsIsoString(self.connection.io, &date_time_buf); // timestamp
 
         defer _ = self.arena.reset(.retain_capacity);
         if (!@typeInfo(ArgsType).@"struct".is_tuple) {
@@ -352,7 +360,7 @@ const SeqClient = struct {
     }
 
     test writeLog {
-        var client: SeqClient = try .init(testing.allocator, .{ .url = undefined, .api_key = "" });
+        var client: SeqClient = try .init(testing.io, testing.allocator, .{ .url = undefined, .api_key = "" });
         defer client.deinit(testing.allocator);
 
         // empty args
@@ -443,60 +451,38 @@ const SeqClient = struct {
 };
 
 const LogIndex = enum(u32) { _ };
+const SeqLogLevel = enum { Verbose, Debug, Information, Warning, Error, Fatal };
 
 fn SeqBody(comptime TBody: type) type {
-    const derived_fields = if (@typeInfo(TBody).@"struct".is_tuple)
-        [_]StructField{} // don't add in fields from a tuple since they're all "0", "1", etc., and that's really meh for structured logging
-    else struct_fields: {
-        var fields: [@typeInfo(TBody).@"struct".fields.len]StructField = undefined;
-        for (&fields, @typeInfo(TBody).@"struct".fields) |*derived, field| derived.* = .{
-            .name = field.name,
-            .type = []const u8, // all of these are gonna be strings
-            .default_value_ptr = @ptrCast(@as(*const []const u8, &"")), // default to empty strnig
-            .alignment = @alignOf([]const u8),
-            .is_comptime = false,
+    const derived_field_names, const derived_field_types, const derived_field_attrs =
+        if (@typeInfo(TBody).@"struct".is_tuple)
+            // don't add in fields from a tuple since they're all "0", "1", etc., and that's really meh for structured logging
+            .{ [_][]const u8{}, [_]type{}, [_]std.builtin.Type.StructField.Attributes{} }
+        else derived_fields: {
+            var names: [@typeInfo(TBody).@"struct".fields.len][]const u8 = undefined;
+            var types: [@typeInfo(TBody).@"struct".fields.len]type = undefined;
+            var attrs: [@typeInfo(TBody).@"struct".fields.len]std.builtin.Type.StructField.Attributes = undefined;
+            for (&names, &types, &attrs, @typeInfo(TBody).@"struct".fields) |*name, *t, *attr, field| {
+                name.* = field.name;
+                t.* = []const u8;
+                attr.* = .{
+                    .@"comptime" = false,
+                    .@"align" = @alignOf([]const u8),
+                    .default_value_ptr = @ptrCast(@as(*const []const u8, &"")),
+                };
+            }
+            break :derived_fields .{ names, types, attrs };
         };
-        break :struct_fields fields;
-    };
 
-    const SeqLogLevel = enum { Verbose, Debug, Information, Warning, Error, Fatal };
-    return @as(type, @Type(.{
-        .@"struct" = .{
-            .fields = &(derived_fields ++ [_]StructField{
-                .{
-                    .name = "@t",
-                    .type = []const u8,
-                    .default_value_ptr = null,
-                    .alignment = @alignOf([]const u8),
-                    .is_comptime = false,
-                },
-                .{
-                    .name = "@l",
-                    .type = SeqLogLevel,
-                    .default_value_ptr = null,
-                    .alignment = @alignOf(SeqLogLevel),
-                    .is_comptime = false,
-                },
-                .{
-                    .name = "@m",
-                    .type = []const u8,
-                    .default_value_ptr = @ptrCast(@as(*const []const u8, &"")),
-                    .alignment = @alignOf([]const u8),
-                    .is_comptime = false,
-                },
-                .{
-                    .name = "scope",
-                    .type = []const u8,
-                    .default_value_ptr = @ptrCast(@as(*const []const u8, &"")),
-                    .alignment = @alignOf([]const u8),
-                    .is_comptime = false,
-                },
-            }),
-            .decls = &.{},
-            .is_tuple = false,
-            .layout = .auto,
-        },
-    }));
+    const field_names = derived_field_names ++ .{ "@t", "@l", "@m", "scope" };
+    const field_types = derived_field_types ++ .{ []const u8, SeqLogLevel, []const u8, []const u8 };
+    const field_attrs = derived_field_attrs ++ [_]std.builtin.Type.StructField.Attributes{
+        .{ .default_value_ptr = null, .@"comptime" = false, .@"align" = @alignOf([]const u8) },
+        .{ .default_value_ptr = null, .@"comptime" = false, .@"align" = @alignOf(SeqLogLevel) },
+        .{ .default_value_ptr = @ptrCast(@as(*const []const u8, &"")), .@"comptime" = false, .@"align" = @alignOf([]const u8) },
+        .{ .default_value_ptr = @ptrCast(@as(*const []const u8, &"")), .@"comptime" = false, .@"align" = @alignOf([]const u8) },
+    };
+    return @Struct(.auto, null, &field_names, &field_types, &field_attrs);
 }
 
 comptime {

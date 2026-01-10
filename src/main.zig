@@ -14,10 +14,13 @@ pub fn main() !void {
     defer if (builtin.mode == .Debug)
         std.debug.assert(debug_allocator.deinit() == .ok);
 
+    var threaded: Io.Threaded = .init(gpa, .{ .environ = .empty });
+    defer threaded.deinit();
+
     // Prints to stderr, ignoring potential errors.
     std.debug.print("Beginning integration test\n", .{});
 
-    try seq_background_worker.start(gpa, .{
+    try seq_background_worker.start(threaded.io(), gpa, .{
         .url = try std.Uri.parse("http://localhost:5341/api/ingest/clef"),
         .api_key = "",
     });
@@ -33,6 +36,7 @@ const std = @import("std");
 const seq_zig = @import("seq_zig");
 const builtin = @import("builtin");
 const log = std.log.scoped(.integration_test);
+const Io = std.Io;
 const SeqBackgroundWorker = seq_zig.SeqBackgroundWorker;
 const SeqConfig = seq_zig.SeqConfig;
 const seqLogFn = seq_zig.seqLogFn;
