@@ -3,24 +3,11 @@ pub const std_options: std.Options = .{ .logFn = seqLogFn };
 /// Seq background worker
 pub var seq_background_worker: SeqBackgroundWorker = .init;
 
-var debug_allocator: DebugAllocator(.{}) = .init;
-const gpa: Allocator = switch (builtin.mode) {
-    .Debug => debug_allocator.allocator(),
-    .ReleaseSafe, .ReleaseFast => std.heap.smp_allocator,
-    .ReleaseSmall => std.heap.page_allocator,
-};
-
-pub fn main() !void {
-    defer if (builtin.mode == .Debug)
-        std.debug.assert(debug_allocator.deinit() == .ok);
-
-    var threaded: Io.Threaded = .init(gpa, .{ .environ = .empty });
-    defer threaded.deinit();
-
+pub fn main(init: std.process.Init) !void {
     // Prints to stderr, ignoring potential errors.
     std.debug.print("Beginning integration test\n", .{});
 
-    try seq_background_worker.start(threaded.io(), gpa, .{
+    try seq_background_worker.start(init.io, init.gpa, .{
         .url = try std.Uri.parse("http://localhost:5341/api/ingest/clef"),
         .api_key = "",
     });
