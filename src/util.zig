@@ -1,8 +1,8 @@
 //! Utility functions
 
 /// UTC now, formatted as YYYY-MM-DDThh:mm:ss.fffZ
-pub fn utcNowAsIsoString(io: Io, buf: *[24]u8) Io.Clock.Error![]const u8 {
-    const timestamp: Io.Timestamp = try Io.Clock.real.now(io);
+pub fn utcNowAsIsoString(io: Io, buf: *[24]u8) []const u8 {
+    const timestamp: Io.Timestamp = .now(io, .real);
     const ms_now: i64 = timestamp.toMilliseconds();
     const sec_now: i64 = std.math.divFloor(i64, ms_now, 1000) catch unreachable;
     const minutes_now: i64 = std.math.divFloor(i64, sec_now, 60) catch unreachable;

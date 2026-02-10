@@ -128,7 +128,7 @@ pub fn seqLogFn(
 ) void {
     const root = @import("root");
     if (comptime @hasDecl(root, SeqBackgroundWorker.root_decl_name) and
-        @TypeOf(@field(root, SeqBackgroundWorker.root_decl_name)) == SeqBackgroundWorker)
+        @TypeOf(root.seq_background_worker) == SeqBackgroundWorker)
     {
         // still write to std err no matter what
         defaultStdErr(level, scope, log, args);
@@ -169,27 +169,38 @@ const SeqClient = struct {
     /// Configuration
     config: SeqConfig,
     /// Timer for determining if we've passed the flush interval
-    timer: Timer,
+    timer: Io.Timeout,
     /// Mutex to ensure that writes and flushes do not interfere with one another (ref to the mutex in the background worker)
-    mutex: Mutex,
+    mutex: Io.Mutex,
 
     const ParamsAndSpecifiers = struct {
         param: []const u8,
         specifier: []const u8,
     };
 
-    const Error = HttpClient.ConnectError || HttpRequest.ReceiveHeadError || std.http.Reader.BodyError || error{NonSuccessResponse};
+    const Error = HttpClient.ConnectError ||
+        HttpRequest.ReceiveHeadError ||
+        std.http.Reader.BodyError ||
+        error{NonSuccessResponse};
 
-    fn init(io: Io, gpa: Allocator, config: SeqConfig) (Allocator.Error || Timer.Error)!SeqClient {
+    fn init(io: Io, gpa: Allocator, config: SeqConfig) (Allocator.Error || Io.ConcurrentError)!SeqClient {
         return .{
             .bytes = try .initCapacity(gpa, config.log_capacity * 2),
             .indices = try .initCapacity(gpa, @divTrunc(config.log_capacity, 2)),
             .arena = .init(gpa),
             .connection = .{ .io = io, .allocator = gpa },
             .config = config,
-            .timer = try .start(),
-            .mutex = .{},
+            .timer = .{
+                .deadline = Io.Clock.real.now(io)
+                    .addDuration(.fromMilliseconds(config.flush_interval_ms))
+                    .withClock(.real),
+            },
+            .mutex = .init,
         };
+    }
+
+    fn getIo(self: *const SeqClient) Io {
+        return self.connection.io;
     }
 
     fn writeLog(
@@ -198,7 +209,7 @@ const SeqClient = struct {
         comptime scope: @EnumLiteral(),
         comptime log: []const u8,
         args: anytype,
-    ) (Allocator.Error || Io.Clock.Error)!void {
+    ) Allocator.Error!void {
         const ArgsType = @TypeOf(args);
         var seq_payload: SeqBody(ArgsType) = undefined;
         seq_payload.scope = @tagName(scope);
@@ -210,7 +221,7 @@ const SeqClient = struct {
         };
 
         var date_time_buf: [24]u8 = undefined;
-        seq_payload.@"@t" = try util.utcNowAsIsoString(self.connection.io, &date_time_buf); // timestamp
+        seq_payload.@"@t" = util.utcNowAsIsoString(self.getIo(), &date_time_buf); // timestamp
 
         defer _ = self.arena.reset(.retain_capacity);
         if (!@typeInfo(ArgsType).@"struct".is_tuple) {
@@ -230,8 +241,8 @@ const SeqClient = struct {
 
         // critical section
         {
-            self.mutex.lock();
-            defer self.mutex.unlock();
+            self.mutex.lockUncancelable(self.getIo());
+            defer self.mutex.unlock(self.getIo());
 
             const offset: LogIndex = @enumFromInt(self.bytes.written().len);
             try self.indices.append(self.bytes.allocator, offset);
@@ -298,22 +309,19 @@ const SeqClient = struct {
     }
 
     fn evaluate(self: *SeqClient) Error!void {
-        // returns nanoseconds elapsed
-        const ms: u64 = @intFromFloat(
-            @trunc(
-                @as(f64, @floatFromInt(self.timer.read())) / 1_000_000.0,
-            ),
-        );
-        if (ms >= self.config.flush_interval_ms or
-            self.bytes.written().len >= self.config.log_capacity)
-        {
+        if (self.timer.toDurationFromNow(self.getIo()).?.raw.nanoseconds <= 0) {
             try self.flush();
+            self.timer = .{
+                .deadline = Io.Clock.real.now(self.getIo())
+                    .addDuration(.fromMilliseconds(self.config.flush_interval_ms))
+                    .withClock(.real),
+            };
         }
     }
 
     fn flush(self: *SeqClient) Error!void {
-        self.mutex.lock();
-        defer self.mutex.unlock();
+        self.mutex.lockUncancelable(self.getIo());
+        defer self.mutex.unlock(self.getIo());
 
         for (self.indices.items) |idx| {
             // these should be the JSON bodies prepared to be sent
@@ -349,7 +357,11 @@ const SeqClient = struct {
     fn reset(self: *SeqClient) void {
         self.bytes.clearRetainingCapacity();
         self.indices.clearRetainingCapacity();
-        self.timer.reset();
+        self.timer = .{
+            .deadline = Io.Clock.real.now(self.getIo())
+                .addDuration(.fromMilliseconds(self.config.flush_interval_ms))
+                .withClock(.real),
+        };
     }
 
     fn deinit(self: *SeqClient, gpa: Allocator) void {
@@ -508,7 +520,6 @@ const Uri = std.Uri;
 const HttpClient = std.http.Client;
 const HttpRequest = HttpClient.Request;
 const HttpResponse = HttpClient.Response;
-const Timer = std.time.Timer;
 const StructField = std.builtin.Type.StructField;
 const LogLevel = std.log.Level;
 const defaultStdErr = std.log.defaultLog;
