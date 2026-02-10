@@ -168,8 +168,8 @@ const SeqClient = struct {
     connection: HttpClient,
     /// Configuration
     config: SeqConfig,
-    /// Timer for determining if we've passed the flush interval
-    timer: Io.Timeout,
+    /// The last time the logs sent to the client
+    last_flush: Io.Timestamp,
     /// Mutex to ensure that writes and flushes do not interfere with one another (ref to the mutex in the background worker)
     mutex: Io.Mutex,
 
@@ -183,18 +183,14 @@ const SeqClient = struct {
         std.http.Reader.BodyError ||
         error{NonSuccessResponse};
 
-    fn init(io: Io, gpa: Allocator, config: SeqConfig) (Allocator.Error || Io.ConcurrentError)!SeqClient {
+    fn init(io: Io, gpa: Allocator, config: SeqConfig) Allocator.Error!SeqClient {
         return .{
             .bytes = try .initCapacity(gpa, config.log_capacity * 2),
             .indices = try .initCapacity(gpa, @divTrunc(config.log_capacity, 2)),
             .arena = .init(gpa),
             .connection = .{ .io = io, .allocator = gpa },
             .config = config,
-            .timer = .{
-                .deadline = Io.Clock.real.now(io)
-                    .addDuration(.fromMilliseconds(config.flush_interval_ms))
-                    .withClock(.real),
-            },
+            .last_flush = .now(io, .real),
             .mutex = .init,
         };
     }
@@ -309,13 +305,8 @@ const SeqClient = struct {
     }
 
     fn evaluate(self: *SeqClient) Error!void {
-        if (self.timer.toDurationFromNow(self.getIo()).?.raw.nanoseconds <= 0) {
+        if (self.last_flush.durationTo(.now(self.getIo(), .real)).toMilliseconds() >= self.config.flush_interval_ms) {
             try self.flush();
-            self.timer = .{
-                .deadline = Io.Clock.real.now(self.getIo())
-                    .addDuration(.fromMilliseconds(self.config.flush_interval_ms))
-                    .withClock(.real),
-            };
         }
     }
 
@@ -357,11 +348,7 @@ const SeqClient = struct {
     fn reset(self: *SeqClient) void {
         self.bytes.clearRetainingCapacity();
         self.indices.clearRetainingCapacity();
-        self.timer = .{
-            .deadline = Io.Clock.real.now(self.getIo())
-                .addDuration(.fromMilliseconds(self.config.flush_interval_ms))
-                .withClock(.real),
-        };
+        self.last_flush = .now(self.getIo(), .real);
     }
 
     fn deinit(self: *SeqClient, gpa: Allocator) void {
