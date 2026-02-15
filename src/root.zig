@@ -10,6 +10,10 @@
 //! pub const std_options: std.Options = .{ .logFn = seqLogFn };
 //! // must be mutable and public with this name
 //! pub var seq_background_worker: SeqBackgroundWorker = .init;
+//! // optionally declare additional properties to send in each log message
+//! pub const log_props = .{
+//!     .application = "My Awesome App",
+//! };
 //!
 //! pub fn main() !void {
 //!     // assuming Io and Allocator interfaces...
@@ -98,7 +102,7 @@ pub const SeqBackgroundWorker = struct {
             if (@errorReturnTrace()) |t| debug.dumpStackTrace(t);
             switch (err) {
                 // any others that should kill the background thread?
-                Allocator.Error.OutOfMemory, error.ConnectionRefused => |e| {
+                error.OutOfMemory, error.ConnectionRefused => |e| {
                     debug.print("FATAL: SeqBackgroundWorker encountered unrecoverable error: {t}. Returning from background thread...\n", .{e});
                     return;
                 },
@@ -108,9 +112,9 @@ pub const SeqBackgroundWorker = struct {
 
         // received sig kill
         debug.print("Flushing Seq client...\n", .{});
-        if (self.client.flush())
-            debug.print("Seq client successfully flushed all logs.\n", .{})
-        else |err| {
+        if (self.client.flush()) {
+            debug.print("Seq client successfully flushed all logs.\n", .{});
+        } else |err| {
             if (@errorReturnTrace()) |t| debug.dumpStackTrace(t);
             debug.print("ERROR: Failed to flush Seq client on shutdown: {t}\n", .{err});
         }
@@ -143,13 +147,9 @@ pub fn seqLogFn(
             // spin...
         }
 
-        background_worker.client.writeLog(level, scope, log, args) catch |err| {
+        background_worker.client.writeLog(level, scope, log, args) catch {
             if (@errorReturnTrace()) |t| debug.dumpStackTrace(t);
-            switch (err) {
-                Allocator.Error.OutOfMemory => debug.print("FATAL: SeqBackgroundWorker ran out of memory. Killing background thread...\n", .{}),
-                Io.Clock.Error.UnsupportedClock => debug.print("FATAL: Clock not supported. Killing background thread...\n", .{}),
-                Io.Clock.Error.Unexpected => return debug.print("ERROR: SeqBackgroundWorker encountered unexpected error while getting current time.\n", .{}),
-            }
+            debug.print("FATAL: SeqBackgroundWorker ran out of memory. Killing background thread...\n", .{});
             // kill the background worker
             background_worker.signal.store(.stopped, .seq_cst);
         };
@@ -325,10 +325,10 @@ const SeqClient = struct {
             defer request.deinit();
 
             try request.sendBodyComplete(entry);
-            var response: HttpResponse = try request.receiveHead(&.{});
+            var buf: struct { redirect: [1024]u8, resp_body: [1024]u8 } = undefined;
+            var response: HttpResponse = try request.receiveHead(&buf.redirect);
             if (response.head.status.class() != .success) {
-                var buf: [2048]u8 = undefined;
-                const reader: *Io.Reader = response.reader(&buf);
+                const reader: *Io.Reader = response.reader(&buf.resp_body);
 
                 var stream: Io.Writer.Allocating = .init(self.bytes.allocator);
                 defer stream.deinit();
@@ -454,6 +454,29 @@ const LogIndex = enum(u32) { _ };
 const SeqLogLevel = enum { Verbose, Debug, Information, Warning, Error, Fatal };
 
 fn SeqBody(comptime TBody: type) type {
+    // additional props declared at root
+    const added_field_names, const added_field_types, const added_field_attrs = added_fields: {
+        const root = @import("root");
+        if (@hasDecl(root, "log_props") and @typeInfo(@TypeOf(root.log_props)) == .@"struct") {
+            const props_fields = @typeInfo(@TypeOf(root.log_props)).@"struct".fields;
+            var names: [props_fields.len][]const u8 = undefined;
+            var types: [props_fields.len]type = undefined;
+            var attrs: [props_fields.len]std.builtin.Type.StructField.Attributes = undefined;
+            for (&names, &types, &attrs, props_fields) |*name, *t, *attr, field| {
+                name.* = field.name;
+                t.* = field.type;
+                attr.* = .{
+                    // MUST be comptime-set
+                    .@"comptime" = true,
+                    .@"align" = @alignOf(field.type),
+                    .default_value_ptr = @ptrCast(@as(*const field.type, &@field(root.log_props, field.name))),
+                };
+            }
+            break :added_fields .{ names, types, attrs };
+        }
+        break :added_fields .{ [_][]const u8{}, [_]type{}, [_]std.builtin.Type.StructField.Attributes{} };
+    };
+    // derived props from TBody
     const derived_field_names, const derived_field_types, const derived_field_attrs =
         if (@typeInfo(TBody).@"struct".is_tuple)
             // don't add in fields from a tuple since they're all "0", "1", etc., and that's really meh for structured logging
@@ -474,9 +497,9 @@ fn SeqBody(comptime TBody: type) type {
             break :derived_fields .{ names, types, attrs };
         };
 
-    const field_names = derived_field_names ++ .{ "@t", "@l", "@m", "scope" };
-    const field_types = derived_field_types ++ .{ []const u8, SeqLogLevel, []const u8, []const u8 };
-    const field_attrs = derived_field_attrs ++ [_]std.builtin.Type.StructField.Attributes{
+    const field_names = added_field_names ++ derived_field_names ++ .{ "@t", "@l", "@m", "scope" };
+    const field_types = added_field_types ++ derived_field_types ++ .{ []const u8, SeqLogLevel, []const u8, []const u8 };
+    const field_attrs = added_field_attrs ++ derived_field_attrs ++ [_]std.builtin.Type.StructField.Attributes{
         .{ .default_value_ptr = null, .@"comptime" = false, .@"align" = @alignOf([]const u8) },
         .{ .default_value_ptr = null, .@"comptime" = false, .@"align" = @alignOf(SeqLogLevel) },
         .{ .default_value_ptr = @ptrCast(@as(*const []const u8, &"")), .@"comptime" = false, .@"align" = @alignOf([]const u8) },
