@@ -202,7 +202,7 @@ const SeqClient = struct {
         const uri_raw: []u8 = try gpa.alloc(u8, base_url.len + ingestion_path.len);
         errdefer gpa.free(uri_raw);
 
-        @memcpy(uri_raw[0..base_url.len], config.base_url);
+        @memcpy(uri_raw[0..base_url.len], base_url);
         @memcpy(uri_raw[base_url.len..], ingestion_path);
 
         var indices: ArrayList(LogIndex) = try .initCapacity(gpa, @divTrunc(config.log_capacity, 2));
