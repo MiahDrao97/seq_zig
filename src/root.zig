@@ -31,8 +31,9 @@
 
 /// Configuration on the Seq server
 pub const SeqConfig = struct {
-    /// Seq server URL we're posting logs to
-    url: Uri,
+    /// Seq server base URL we're posting logs to (with or without trailing /).
+    /// Currently, the /ingest/clef endpoint is used.
+    base_url: []const u8,
     /// API key
     api_key: []const u8,
     /// How often (in milliseconds) we flush collected logs to the Seq server.
@@ -119,6 +120,13 @@ pub const SeqBackgroundWorker = struct {
             debug.print("ERROR: Failed to flush Seq client on shutdown: {t}\n", .{err});
         }
     }
+
+    fn oomKill(self: *SeqBackgroundWorker, err_return_trace: ?*std.builtin.StackTrace) void {
+        if (err_return_trace) |t| debug.dumpStackTrace(t);
+        debug.print("FATAL: SeqBackgroundWorker ran out of memory. Killing background thread...\n", .{});
+        // kill the background worker
+        self.signal.store(.stopped, .seq_cst);
+    }
 };
 
 /// Assign this log function to `std_options.logFn` in your root file.
@@ -147,17 +155,23 @@ pub fn seqLogFn(
             // spin...
         }
 
-        background_worker.client.writeLog(level, scope, log, args) catch {
-            if (@errorReturnTrace()) |t| debug.dumpStackTrace(t);
-            debug.print("FATAL: SeqBackgroundWorker ran out of memory. Killing background thread...\n", .{});
-            // kill the background worker
-            background_worker.signal.store(.stopped, .seq_cst);
-        };
+        var stream: Io.Writer.Allocating = .init(background_worker.client.arena.allocator());
+        defer _ = background_worker.client.arena.reset(.retain_capacity);
+
+        if (debug.getSelfDebugInfo()) |debug_info| {
+            _ = debug_info;
+        } else |_| {}
+
+        background_worker.client.writeLog(level, scope, log, args, stream.written()) catch background_worker.oomKill(@errorReturnTrace());
     } else @compileError("Root source file does not declare a public global variable of type `" ++ @typeName(SeqBackgroundWorker) ++ "` named '" ++ SeqBackgroundWorker.root_decl_name ++ "'");
 }
 
 /// Client that interfaces with the Seq server
 const SeqClient = struct {
+    /// Ingestion endpoint of the Seq server
+    seq_ingestion_endpoint: Uri,
+    /// Raw bytes of the URI
+    seq_endpoint_raw: []const u8,
     /// Interned JSON payloads to be sent to the Seq server
     bytes: Io.Writer.Allocating,
     /// Offsets with the contiguous region of `bytes`, indicating the start of a new JSON payload until the next null byte
@@ -183,10 +197,25 @@ const SeqClient = struct {
         std.http.Reader.BodyError ||
         error{NonSuccessResponse};
 
-    fn init(io: Io, gpa: Allocator, config: SeqConfig) Allocator.Error!SeqClient {
+    fn init(io: Io, gpa: Allocator, config: SeqConfig) (Allocator.Error || Uri.ParseError)!SeqClient {
+        const base_url: []const u8 = mem.trimEnd(u8, config.base_url, "/");
+        const uri_raw: []u8 = try gpa.alloc(u8, base_url.len + ingestion_path.len);
+        errdefer gpa.free(uri_raw);
+
+        @memcpy(uri_raw[0..base_url.len], config.base_url);
+        @memcpy(uri_raw[base_url.len..], ingestion_path);
+
+        var indices: ArrayList(LogIndex) = try .initCapacity(gpa, @divTrunc(config.log_capacity, 2));
+        errdefer indices.deinit(gpa);
+
+        var bytes: Io.Writer.Allocating = try .initCapacity(gpa, config.log_capacity * 2);
+        errdefer bytes.deinit();
+
         return .{
-            .bytes = try .initCapacity(gpa, config.log_capacity * 2),
-            .indices = try .initCapacity(gpa, @divTrunc(config.log_capacity, 2)),
+            .seq_ingestion_endpoint = try .parse(uri_raw),
+            .seq_endpoint_raw = uri_raw,
+            .bytes = bytes,
+            .indices = indices,
             .arena = .init(gpa),
             .connection = .{ .io = io, .allocator = gpa },
             .config = config,
@@ -205,10 +234,12 @@ const SeqClient = struct {
         comptime scope: @EnumLiteral(),
         comptime log: []const u8,
         args: anytype,
+        location_trace: []const u8,
     ) Allocator.Error!void {
         const ArgsType = @TypeOf(args);
         var seq_payload: SeqBody(ArgsType) = undefined;
         seq_payload.scope = @tagName(scope);
+        seq_payload.location = location_trace;
         seq_payload.@"@l" = switch (level) { // log level
             .debug => .Debug,
             .info => .Information,
@@ -219,7 +250,6 @@ const SeqClient = struct {
         var date_time_buf: [24]u8 = undefined;
         seq_payload.@"@t" = util.utcNowAsIsoString(self.getIo(), &date_time_buf); // timestamp
 
-        defer _ = self.arena.reset(.retain_capacity);
         if (!@typeInfo(ArgsType).@"struct".is_tuple) {
             // copy fields from args struct, which then become parameterized values given to Seq
             const params: [@typeInfo(ArgsType).@"struct".fields.len]ParamsAndSpecifiers = parametersAndSpecifiers(log, ArgsType);
@@ -317,7 +347,7 @@ const SeqClient = struct {
         for (self.indices.items) |idx| {
             // these should be the JSON bodies prepared to be sent
             const entry: []u8 = mem.sliceTo(self.bytes.written()[@intFromEnum(idx)..], 0);
-            var request: HttpRequest = try self.connection.request(.POST, self.config.url, .{
+            var request: HttpRequest = try self.connection.request(.POST, self.seq_ingestion_endpoint, .{
                 .headers = .{
                     .authorization = .{ .override = self.config.api_key },
                 },
@@ -352,6 +382,7 @@ const SeqClient = struct {
     }
 
     fn deinit(self: *SeqClient, gpa: Allocator) void {
+        gpa.free(self.seq_endpoint_raw);
         self.connection.deinit();
         self.bytes.deinit();
         self.indices.deinit(gpa);
@@ -360,14 +391,14 @@ const SeqClient = struct {
     }
 
     test writeLog {
-        var client: SeqClient = try .init(testing.io, testing.allocator, .{ .url = undefined, .api_key = "" });
+        var client: SeqClient = try .init(testing.io, testing.allocator, .{ .base_url = "https://my_seq.com", .api_key = "" });
         defer client.deinit(testing.allocator);
 
         // empty args
         {
             defer client.reset();
 
-            try client.writeLog(.debug, .testing, "This is a log", .{});
+            try client.writeLog(.debug, .testing, "This is a log", .{}, "");
             const Body = SeqBody(@TypeOf(.{}));
 
             const written: []const u8 = mem.sliceTo(client.bytes.written(), 0);
@@ -382,7 +413,7 @@ const SeqClient = struct {
         {
             defer client.reset();
 
-            try client.writeLog(.debug, .testing, "This is a log {d}: {s}", .{ 0, "yay" });
+            try client.writeLog(.debug, .testing, "This is a log {d}: {s}", .{ 0, "yay" }, "");
             const Body = SeqBody(@TypeOf(.{}));
 
             const written: []const u8 = mem.sliceTo(client.bytes.written(), 0);
@@ -398,7 +429,7 @@ const SeqClient = struct {
             defer client.reset();
             const args = .{ .num = 0, .message = "yay" };
 
-            try client.writeLog(.debug, .testing, "This is a log {[num]d}: {[message]s}", args);
+            try client.writeLog(.debug, .testing, "This is a log {[num]d}: {[message]s}", args, "");
             const Body = SeqBody(@TypeOf(args));
 
             const written: []const u8 = mem.sliceTo(client.bytes.written(), 0);
@@ -416,7 +447,7 @@ const SeqClient = struct {
             defer client.reset();
             const args = .{ .num = 0, .message = "yay" };
 
-            try client.writeLog(.debug, .testing, "This is a log {[num]d}{[num]d}: {[message]s}", args);
+            try client.writeLog(.debug, .testing, "This is a log {[num]d}{[num]d}: {[message]s}", args, "");
             const Body = SeqBody(@TypeOf(args));
 
             const written: []const u8 = mem.sliceTo(client.bytes.written(), 0);
@@ -434,7 +465,7 @@ const SeqClient = struct {
             defer client.reset();
             const args = .{ .num = 0, .message = "yay" };
 
-            try client.writeLog(.debug, .testing, "This is a log {[num]d} {[num]d:0>4}: {[message]s}", args);
+            try client.writeLog(.debug, .testing, "This is a log {[num]d} {[num]d:0>4}: {[message]s}", args, "");
             const Body = SeqBody(@TypeOf(args));
 
             const written: []const u8 = mem.sliceTo(client.bytes.written(), 0);
@@ -457,7 +488,10 @@ fn SeqBody(comptime TBody: type) type {
     // additional props declared at root
     const added_field_names, const added_field_types, const added_field_attrs = added_fields: {
         const root = @import("root");
-        if (@hasDecl(root, "log_props") and @typeInfo(@TypeOf(root.log_props)) == .@"struct") {
+        if (@hasDecl(root, "log_props") and
+            @typeInfo(@TypeOf(root.log_props)) == .@"struct" and
+            !@typeInfo(@TypeOf(root.log_props)).@"struct".is_tuple)
+        {
             const props_fields = @typeInfo(@TypeOf(root.log_props)).@"struct".fields;
             var names: [props_fields.len][]const u8 = undefined;
             var types: [props_fields.len]type = undefined;
@@ -497,11 +531,12 @@ fn SeqBody(comptime TBody: type) type {
             break :derived_fields .{ names, types, attrs };
         };
 
-    const field_names = added_field_names ++ derived_field_names ++ .{ "@t", "@l", "@m", "scope" };
-    const field_types = added_field_types ++ derived_field_types ++ .{ []const u8, SeqLogLevel, []const u8, []const u8 };
+    const field_names = added_field_names ++ derived_field_names ++ .{ "@t", "@l", "@m", "scope", "location" };
+    const field_types = added_field_types ++ derived_field_types ++ .{ []const u8, SeqLogLevel, []const u8, []const u8, []const u8 };
     const field_attrs = added_field_attrs ++ derived_field_attrs ++ [_]std.builtin.Type.StructField.Attributes{
         .{ .default_value_ptr = null, .@"comptime" = false, .@"align" = @alignOf([]const u8) },
         .{ .default_value_ptr = null, .@"comptime" = false, .@"align" = @alignOf(SeqLogLevel) },
+        .{ .default_value_ptr = @ptrCast(@as(*const []const u8, &"")), .@"comptime" = false, .@"align" = @alignOf([]const u8) },
         .{ .default_value_ptr = @ptrCast(@as(*const []const u8, &"")), .@"comptime" = false, .@"align" = @alignOf([]const u8) },
         .{ .default_value_ptr = @ptrCast(@as(*const []const u8, &"")), .@"comptime" = false, .@"align" = @alignOf([]const u8) },
     };
@@ -513,6 +548,24 @@ comptime {
     _ = SeqClient;
 }
 
+fn getSrc(io: Io, debug_info: *debug.SelfInfo, addr: usize) debug.SelfInfoError!?debug.SourceLocation {
+    const symbol: debug.Symbol = try debug_info.getSymbol(io, addr);
+    return symbol.source_location;
+}
+
+fn walkToLogLocation(addr: usize) usize {
+    // max call stack looks like:
+    // std.log.info(...)
+    // -> std.log.scoped(...).info(...)
+    // -> std.log.log(...)
+    // -> seqLogFn(...) Which is assumed to be the current location
+
+    _ = addr;
+    // TODO : The StackIterator is non-pub now, so... will have to copy stuff
+}
+
+const ingestion_path = "/ingest/clef";
+
 const std = @import("std");
 const util = @import("util.zig");
 const Io = std.Io;
@@ -521,7 +574,6 @@ const json = std.json;
 const mem = std.mem;
 const testing = std.testing;
 const Thread = std.Thread;
-const Mutex = Thread.Mutex;
 const Atomic = std.atomic.Value;
 const Allocator = mem.Allocator;
 const ArenaAllocator = std.heap.ArenaAllocator;

@@ -1,8 +1,10 @@
+//! Sample integration test.
+
 /// Override standard options
 pub const std_options: std.Options = .{ .logFn = seqLogFn };
 /// Seq background worker
 pub var seq_background_worker: SeqBackgroundWorker = .init;
-/// Additional properties to add to every log
+/// Additional properties to add to every log (optional)
 pub const log_props = .{
     .Application = "Zig Test App",
 };
@@ -12,7 +14,7 @@ pub fn main(init: std.process.Init) !void {
     std.debug.print("Beginning integration test\n", .{});
 
     try seq_background_worker.start(init.io, init.gpa, .{
-        .url = try std.Uri.parse("http://localhost:5341/ingest/clef"),
+        .base_url = "http://localhost:5341",
         .api_key = "",
     });
     defer seq_background_worker.shutdown();
