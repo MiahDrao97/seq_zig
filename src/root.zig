@@ -11,7 +11,7 @@
 //! // must be mutable and public with this name
 //! pub var seq_background_worker: SeqBackgroundWorker = .init;
 //! // optionally declare additional properties to send in each log message
-//! pub const log_props = .{
+//! pub const additional_log_props = .{
 //!     .application = "My Awesome App",
 //! };
 //!
@@ -37,9 +37,9 @@ pub const SeqConfig = struct {
     /// API key
     api_key: []const u8,
     /// How often (in milliseconds) we flush collected logs to the Seq server.
-    /// Defaults to 10K (10 seconds).
-    flush_interval_ms: u32 = 10_000,
-    /// Limit space on stored logs before we flush.
+    /// Defaults to 5K (5 seconds).
+    flush_interval_ms: u32 = 5_000,
+    /// Once the collected logs exceeds this threshold, they will be flushed.
     /// Defaults to ~8KB.
     log_capacity: u32 = 8096,
 };
@@ -125,7 +125,7 @@ pub const SeqBackgroundWorker = struct {
         if (err_return_trace) |t| debug.dumpStackTrace(t);
         debug.print("FATAL: SeqBackgroundWorker ran out of memory. Killing background thread...\n", .{});
         // kill the background worker
-        self.signal.store(.stopped, .seq_cst);
+        self.signal.store(.stopped, .release);
     }
 };
 
@@ -140,12 +140,12 @@ pub fn seqLogFn(
 ) void {
     const root = @import("root");
     if (comptime @hasDecl(root, SeqBackgroundWorker.root_decl_name) and
-        @TypeOf(root.seq_background_worker) == SeqBackgroundWorker)
+        @TypeOf(@field(root, SeqBackgroundWorker.root_decl_name)) == SeqBackgroundWorker)
     {
         // still write to std err no matter what
         defaultStdErr(level, scope, log, args);
 
-        const background_worker: *SeqBackgroundWorker = &root.seq_background_worker;
+        const background_worker: *SeqBackgroundWorker = &@field(root, SeqBackgroundWorker.root_decl_name);
         // ensure that everything is initialized before proceeding
         while (switch (background_worker.signal.load(.monotonic)) {
             .staged => true,
@@ -160,10 +160,9 @@ pub fn seqLogFn(
             // max call stack looks like:
             // std.log.info(...)
             // -> std.log.log(...)
-            // -> seqLogFn(...) Which is assumed to be the current location
-
-            const size: usize = 4;
-            var trace: debug.ConfigurableTrace(size, 3, true) = .init;
+            // -> seqLogFn(...)
+            // so only 3 frames are required
+            var trace: debug.ConfigurableTrace(1, 3, true) = .init;
             trace.addAddr(@returnAddress(), "");
 
             const frames: []usize = mem.sliceTo(&trace.addrs[0], 0);
@@ -225,7 +224,7 @@ const SeqClient = struct {
         var indices: ArrayList(LogIndex) = try .initCapacity(gpa, @divTrunc(config.log_capacity, 2));
         errdefer indices.deinit(gpa);
 
-        var bytes: Io.Writer.Allocating = try .initCapacity(gpa, config.log_capacity * 2);
+        var bytes: Io.Writer.Allocating = try .initCapacity(gpa, @intFromFloat(@as(f64, @floatFromInt(config.log_capacity)) * 1.5));
         errdefer bytes.deinit();
 
         return .{
@@ -254,7 +253,6 @@ const SeqClient = struct {
         location: ?debug.SourceLocation,
     ) Allocator.Error!void {
         const ArgsType = @TypeOf(args);
-        var seq_payload: SeqBody(ArgsType) = undefined;
 
         var src_stream: Io.Writer.Allocating = .init(self.arena.allocator());
         defer _ = self.arena.reset(.retain_capacity);
@@ -263,6 +261,7 @@ const SeqClient = struct {
             src_stream.writer.print("{s}:{d}", .{ src.file_name, src.line }) catch return error.OutOfMemory;
         }
 
+        var seq_payload: SeqBody(ArgsType) = undefined;
         seq_payload.scope = @tagName(scope);
         seq_payload.location = src_stream.written();
         seq_payload.@"@l" = switch (level) { // log level
@@ -360,7 +359,9 @@ const SeqClient = struct {
     }
 
     fn evaluate(self: *SeqClient) Error!void {
-        if (self.last_flush.durationTo(.now(self.getIo(), .real)).toMilliseconds() >= self.config.flush_interval_ms) {
+        if (self.last_flush.durationTo(.now(self.getIo(), .real)).toMilliseconds() >= self.config.flush_interval_ms or
+            self.bytes.written().len >= self.config.log_capacity)
+        {
             try self.flush();
         }
     }
@@ -507,20 +508,22 @@ const SeqClient = struct {
 };
 
 const LogIndex = enum(u32) { _ };
-const SeqLogLevel = enum { Verbose, Debug, Information, Warning, Error, Fatal };
+
+/// TODO : It would be nice if we could do one-off overrides of the Seq log level instead of derriving it from the Zig log level
+pub const SeqLogLevel = enum { Verbose, Debug, Information, Warning, Error, Fatal };
 
 fn SeqBody(comptime TBody: type) type {
     // additional props declared at root
     const added_field_names, const added_field_types, const added_field_attrs = added_fields: {
         const root = @import("root");
-        if (@hasDecl(root, "log_props") and
-            @typeInfo(@TypeOf(root.log_props)) == .@"struct" and
-            !@typeInfo(@TypeOf(root.log_props)).@"struct".is_tuple)
+        if (@hasDecl(root, "additional_log_props") and
+            @typeInfo(@TypeOf(root.additional_log_props)) == .@"struct" and
+            !@typeInfo(@TypeOf(root.additional_log_props)).@"struct".is_tuple)
         {
-            const props_fields = @typeInfo(@TypeOf(root.log_props)).@"struct".fields;
+            const props_fields = @typeInfo(@TypeOf(root.additional_log_props)).@"struct".fields;
             var names: [props_fields.len][]const u8 = undefined;
             var types: [props_fields.len]type = undefined;
-            var attrs: [props_fields.len]std.builtin.Type.StructField.Attributes = undefined;
+            var attrs: [props_fields.len]StructField.Attributes = undefined;
             for (&names, &types, &attrs, props_fields) |*name, *t, *attr, field| {
                 name.* = field.name;
                 t.* = field.type;
@@ -528,22 +531,22 @@ fn SeqBody(comptime TBody: type) type {
                     // MUST be comptime-set
                     .@"comptime" = true,
                     .@"align" = @alignOf(field.type),
-                    .default_value_ptr = @ptrCast(@as(*const field.type, &@field(root.log_props, field.name))),
+                    .default_value_ptr = @ptrCast(@as(*const field.type, &@field(root.additional_log_props, field.name))),
                 };
             }
             break :added_fields .{ names, types, attrs };
         }
-        break :added_fields .{ [_][]const u8{}, [_]type{}, [_]std.builtin.Type.StructField.Attributes{} };
+        break :added_fields .{ [_][]const u8{}, [_]type{}, [_]StructField.Attributes{} };
     };
     // derived props from TBody
     const derived_field_names, const derived_field_types, const derived_field_attrs =
         if (@typeInfo(TBody).@"struct".is_tuple)
             // don't add in fields from a tuple since they're all "0", "1", etc., and that's really meh for structured logging
-            .{ [_][]const u8{}, [_]type{}, [_]std.builtin.Type.StructField.Attributes{} }
+            .{ [_][]const u8{}, [_]type{}, [_]StructField.Attributes{} }
         else derived_fields: {
             var names: [@typeInfo(TBody).@"struct".fields.len][]const u8 = undefined;
             var types: [@typeInfo(TBody).@"struct".fields.len]type = undefined;
-            var attrs: [@typeInfo(TBody).@"struct".fields.len]std.builtin.Type.StructField.Attributes = undefined;
+            var attrs: [@typeInfo(TBody).@"struct".fields.len]StructField.Attributes = undefined;
             for (&names, &types, &attrs, @typeInfo(TBody).@"struct".fields) |*name, *t, *attr, field| {
                 name.* = field.name;
                 t.* = []const u8;
@@ -558,7 +561,7 @@ fn SeqBody(comptime TBody: type) type {
 
     const field_names = added_field_names ++ derived_field_names ++ .{ "@t", "@l", "@m", "scope", "location" };
     const field_types = added_field_types ++ derived_field_types ++ .{ []const u8, SeqLogLevel, []const u8, []const u8, []const u8 };
-    const field_attrs = added_field_attrs ++ derived_field_attrs ++ [_]std.builtin.Type.StructField.Attributes{
+    const field_attrs = added_field_attrs ++ derived_field_attrs ++ [_]StructField.Attributes{
         .{ .default_value_ptr = null, .@"comptime" = false, .@"align" = @alignOf([]const u8) },
         .{ .default_value_ptr = null, .@"comptime" = false, .@"align" = @alignOf(SeqLogLevel) },
         .{ .default_value_ptr = @ptrCast(@as(*const []const u8, &"")), .@"comptime" = false, .@"align" = @alignOf([]const u8) },
@@ -597,6 +600,6 @@ const Uri = std.Uri;
 const HttpClient = std.http.Client;
 const HttpRequest = HttpClient.Request;
 const HttpResponse = HttpClient.Response;
-const StructField = std.builtin.Type.StructField;
+const StructField = builtin.Type.StructField;
 const LogLevel = std.log.Level;
 const defaultStdErr = std.log.defaultLog;

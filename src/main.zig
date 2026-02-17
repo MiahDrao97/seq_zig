@@ -5,7 +5,7 @@ pub const std_options: std.Options = .{ .logFn = seqLogFn };
 /// Seq background worker
 pub var seq_background_worker: SeqBackgroundWorker = .init;
 /// Additional properties to add to every log (optional)
-pub const log_props = .{
+pub const additional_log_props = .{
     .Application = "Zig Test App",
 };
 
