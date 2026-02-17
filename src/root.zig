@@ -166,19 +166,10 @@ pub fn seqLogFn(
             var trace: debug.ConfigurableTrace(size, 3, true) = .init;
             trace.addAddr(@returnAddress(), "");
 
-            const end: usize = @min(trace.index, size);
-            for (trace.addrs[0..end]) |*frames_array| {
-                const frames: []usize = mem.sliceTo(frames_array, 0);
-                const stack_trace: builtin.StackTrace = .{
-                    .index = frames.len,
-                    .instruction_addresses = frames,
-                };
-                if (debug_info.getSymbol(
-                    background_worker.client.getIo(),
-                    stack_trace.instruction_addresses[0],
-                ) catch null) |sym| {
+            const frames: []usize = mem.sliceTo(&trace.addrs[0], 0);
+            for (frames) |addr| {
+                if (debug_info.getSymbol(background_worker.client.getIo(), addr) catch null) |sym| {
                     const src: debug.SourceLocation = @as(debug.Symbol, sym).source_location orelse continue;
-                    debug.print("Stack location: {s}:{d}\n", .{ src.file_name, src.line });
                     // skip these traces...
                     if (!mem.endsWith(u8, src.file_name, "log.zig")) {
                         calling_src = src;
