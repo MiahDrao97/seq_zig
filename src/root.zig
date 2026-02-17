@@ -121,7 +121,7 @@ pub const SeqBackgroundWorker = struct {
         }
     }
 
-    fn oomKill(self: *SeqBackgroundWorker, err_return_trace: ?*std.builtin.StackTrace) void {
+    fn oomKill(self: *SeqBackgroundWorker, err_return_trace: ?*builtin.StackTrace) void {
         if (err_return_trace) |t| debug.dumpStackTrace(t);
         debug.print("FATAL: SeqBackgroundWorker ran out of memory. Killing background thread...\n", .{});
         // kill the background worker
@@ -155,14 +155,35 @@ pub fn seqLogFn(
             // spin...
         }
 
-        var stream: Io.Writer.Allocating = .init(background_worker.client.arena.allocator());
-        defer _ = background_worker.client.arena.reset(.retain_capacity);
-
+        var calling_src: ?debug.SourceLocation = null;
         if (debug.getSelfDebugInfo()) |debug_info| {
-            _ = debug_info;
+            // max call stack looks like:
+            // std.log.info(...)
+            // -> std.log.log(...)
+            // -> seqLogFn(...) Which is assumed to be the current location
+
+            var trace: debug.ConfigurableTrace(4, 3, true) = .init;
+            trace.addAddr(@returnAddress(), "");
+
+            var addr_buf: [4]usize = undefined;
+            const stack_trace: builtin.StackTrace = debug.captureCurrentStackTrace(.{ .first_address = @returnAddress() }, &addr_buf);
+            var i: usize = 0;
+            while (getSrc(
+                background_worker.client.getIo(),
+                debug_info,
+                stack_trace.instruction_addresses[i],
+            ) catch null) |src| : (i += 1) {
+                // skip these traces...
+                if (!mem.endsWith(u8, src.file_name, "std/log.zig") and
+                    !mem.endsWith(u8, src.file_name, "seq_zig/src/root.zig"))
+                {
+                    calling_src = src;
+                    break;
+                }
+            }
         } else |_| {}
 
-        background_worker.client.writeLog(level, scope, log, args, stream.written()) catch background_worker.oomKill(@errorReturnTrace());
+        background_worker.client.writeLog(level, scope, log, args, calling_src) catch background_worker.oomKill(@errorReturnTrace());
     } else @compileError("Root source file does not declare a public global variable of type `" ++ @typeName(SeqBackgroundWorker) ++ "` named '" ++ SeqBackgroundWorker.root_decl_name ++ "'");
 }
 
@@ -234,12 +255,20 @@ const SeqClient = struct {
         comptime scope: @EnumLiteral(),
         comptime log: []const u8,
         args: anytype,
-        location_trace: []const u8,
+        location: ?debug.SourceLocation,
     ) Allocator.Error!void {
         const ArgsType = @TypeOf(args);
         var seq_payload: SeqBody(ArgsType) = undefined;
+
+        var src_stream: Io.Writer.Allocating = .init(self.arena.allocator());
+        defer _ = self.arena.reset(.retain_capacity);
+
+        if (location) |src| {
+            src_stream.writer.print("{s}:{d}", .{ src.file_name, src.line }) catch return error.OutOfMemory;
+        }
+
         seq_payload.scope = @tagName(scope);
-        seq_payload.location = location_trace;
+        seq_payload.location = src_stream.written();
         seq_payload.@"@l" = switch (level) { // log level
             .debug => .Debug,
             .info => .Information,
@@ -398,7 +427,7 @@ const SeqClient = struct {
         {
             defer client.reset();
 
-            try client.writeLog(.debug, .testing, "This is a log", .{}, "");
+            try client.writeLog(.debug, .testing, "This is a log", .{}, null);
             const Body = SeqBody(@TypeOf(.{}));
 
             const written: []const u8 = mem.sliceTo(client.bytes.written(), 0);
@@ -413,7 +442,7 @@ const SeqClient = struct {
         {
             defer client.reset();
 
-            try client.writeLog(.debug, .testing, "This is a log {d}: {s}", .{ 0, "yay" }, "");
+            try client.writeLog(.debug, .testing, "This is a log {d}: {s}", .{ 0, "yay" }, null);
             const Body = SeqBody(@TypeOf(.{}));
 
             const written: []const u8 = mem.sliceTo(client.bytes.written(), 0);
@@ -429,7 +458,7 @@ const SeqClient = struct {
             defer client.reset();
             const args = .{ .num = 0, .message = "yay" };
 
-            try client.writeLog(.debug, .testing, "This is a log {[num]d}: {[message]s}", args, "");
+            try client.writeLog(.debug, .testing, "This is a log {[num]d}: {[message]s}", args, null);
             const Body = SeqBody(@TypeOf(args));
 
             const written: []const u8 = mem.sliceTo(client.bytes.written(), 0);
@@ -447,7 +476,7 @@ const SeqClient = struct {
             defer client.reset();
             const args = .{ .num = 0, .message = "yay" };
 
-            try client.writeLog(.debug, .testing, "This is a log {[num]d}{[num]d}: {[message]s}", args, "");
+            try client.writeLog(.debug, .testing, "This is a log {[num]d}{[num]d}: {[message]s}", args, null);
             const Body = SeqBody(@TypeOf(args));
 
             const written: []const u8 = mem.sliceTo(client.bytes.written(), 0);
@@ -465,7 +494,7 @@ const SeqClient = struct {
             defer client.reset();
             const args = .{ .num = 0, .message = "yay" };
 
-            try client.writeLog(.debug, .testing, "This is a log {[num]d} {[num]d:0>4}: {[message]s}", args, "");
+            try client.writeLog(.debug, .testing, "This is a log {[num]d} {[num]d:0>4}: {[message]s}", args, null);
             const Body = SeqBody(@TypeOf(args));
 
             const written: []const u8 = mem.sliceTo(client.bytes.written(), 0);
@@ -553,23 +582,13 @@ fn getSrc(io: Io, debug_info: *debug.SelfInfo, addr: usize) debug.SelfInfoError!
     return symbol.source_location;
 }
 
-fn walkToLogLocation(addr: usize) usize {
-    // max call stack looks like:
-    // std.log.info(...)
-    // -> std.log.scoped(...).info(...)
-    // -> std.log.log(...)
-    // -> seqLogFn(...) Which is assumed to be the current location
-
-    _ = addr;
-    // TODO : The StackIterator is non-pub now, so... will have to copy stuff
-}
-
 const ingestion_path = "/ingest/clef";
 
 const std = @import("std");
 const util = @import("util.zig");
 const Io = std.Io;
 const debug = std.debug;
+const builtin = std.builtin;
 const json = std.json;
 const mem = std.mem;
 const testing = std.testing;
