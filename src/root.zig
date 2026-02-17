@@ -162,23 +162,28 @@ pub fn seqLogFn(
             // -> std.log.log(...)
             // -> seqLogFn(...) Which is assumed to be the current location
 
-            var trace: debug.ConfigurableTrace(4, 3, true) = .init;
+            const size: usize = 4;
+            var trace: debug.ConfigurableTrace(size, 3, true) = .init;
             trace.addAddr(@returnAddress(), "");
 
-            var addr_buf: [4]usize = undefined;
-            const stack_trace: builtin.StackTrace = debug.captureCurrentStackTrace(.{ .first_address = @returnAddress() }, &addr_buf);
-            var i: usize = 0;
-            while (getSrc(
-                background_worker.client.getIo(),
-                debug_info,
-                stack_trace.instruction_addresses[i],
-            ) catch null) |src| : (i += 1) {
-                // skip these traces...
-                if (!mem.endsWith(u8, src.file_name, "std/log.zig") and
-                    !mem.endsWith(u8, src.file_name, "seq_zig/src/root.zig"))
-                {
-                    calling_src = src;
-                    break;
+            const end: usize = @min(trace.index, size);
+            for (trace.addrs[0..end]) |*frames_array| {
+                const frames: []usize = mem.sliceTo(frames_array, 0);
+                const stack_trace: builtin.StackTrace = .{
+                    .index = frames.len,
+                    .instruction_addresses = frames,
+                };
+                if (debug_info.getSymbol(
+                    background_worker.client.getIo(),
+                    stack_trace.instruction_addresses[0],
+                ) catch null) |sym| {
+                    const src: debug.SourceLocation = @as(debug.Symbol, sym).source_location orelse continue;
+                    debug.print("Stack location: {s}:{d}\n", .{ src.file_name, src.line });
+                    // skip these traces...
+                    if (!mem.endsWith(u8, src.file_name, "log.zig")) {
+                        calling_src = src;
+                        break;
+                    }
                 }
             }
         } else |_| {}
