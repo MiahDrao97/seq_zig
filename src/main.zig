@@ -19,8 +19,14 @@ pub fn main(init: std.process.Init) !void {
 
     log.debug(@src(), "This is a debug log with {[value]d}", .{ .value = 4 });
     log.info(@src(), "This is an info log with {[string]s}", .{ .string = "asdf" });
-    log.warn(@src(), "WARNING: This could be dangerous {[value]d}", .{ .value = -1 });
-    log.err(@src(), "ERROR: It was dangerous {[string]s}", .{ .string = "dead" });
+    log.warn(@src(), "This could be dangerous {[value]d}", .{ .value = -1 });
+    myFunc() catch |err| {
+        log.err(@src(), "It was dangerous {[string]s}: {[error]t}", .{ .string = "dead", .@"error" = err }, @errorReturnTrace());
+    };
+}
+
+fn myFunc() error{Doh}!void {
+    return error.Doh;
 }
 
 const std = @import("std");

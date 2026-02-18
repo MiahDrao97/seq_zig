@@ -134,15 +134,15 @@ pub const SeqBackgroundWorker = struct {
     }
 };
 
-/// Assign this log function to `std_options.logFn` in your root file.
 /// Assumes a public mutable global variable called "seq_background_worker" of type `SeqBackgroundWorker`.
-/// If that doesn't exist, then only the default log written to STDERR occurs.
+/// Also calls `std.options.logFn` so whichever log function override you provide will still be respected.
 pub fn seqLogFn(
     comptime src: builtin.SourceLocation,
     comptime level: SeqLogLevel,
     comptime scope: @EnumLiteral(),
     comptime log_format: []const u8,
     args: anytype,
+    err_return_trace: ?*const builtin.StackTrace,
 ) void {
     const root = @import("root");
     if (comptime @hasDecl(root, SeqBackgroundWorker.root_decl_name) and
@@ -156,7 +156,7 @@ pub fn seqLogFn(
             .Error, .Fatal => .err,
         };
         if (comptime std.log.logEnabled(std_level, scope)) {
-            defaultStdErr(std_level, scope, log_format, args);
+            std.options.logFn(std_level, scope, log_format, args);
         }
 
         const background_worker: *SeqBackgroundWorker = &@field(root, SeqBackgroundWorker.root_decl_name);
@@ -169,7 +169,14 @@ pub fn seqLogFn(
             // spin...
         }
 
-        background_worker.client.writeLog(level, scope, log_format, args, src) catch background_worker.oomKill(@errorReturnTrace());
+        background_worker.client.writeLog(
+            level,
+            scope,
+            log_format,
+            args,
+            src,
+            err_return_trace,
+        ) catch background_worker.oomKill(@errorReturnTrace());
     } else @compileError("Root source file does not declare a public global variable of type `" ++ @typeName(SeqBackgroundWorker) ++ "` named '" ++ SeqBackgroundWorker.root_decl_name ++ "'");
 }
 
@@ -242,6 +249,7 @@ const SeqClient = struct {
         comptime log_format: []const u8,
         args: anytype,
         src: builtin.SourceLocation,
+        err_return_trace: ?*const builtin.StackTrace,
     ) Allocator.Error!void {
         const ArgsType = @TypeOf(args);
 
@@ -263,6 +271,13 @@ const SeqClient = struct {
         seq_payload.scope = @tagName(scope);
         seq_payload.location = src_stream.written();
         seq_payload.@"@l" = level;
+        seq_payload.error_trace = if (err_return_trace) |err_trace| write_err_trace: {
+            var err_trace_stream: Io.Writer.Allocating = .init(self.arena.allocator());
+            const terminal: Io.Terminal = .{ .writer = &err_trace_stream.writer, .mode = .no_color };
+
+            debug.writeStackTrace(err_trace, terminal) catch return error.OutOfMemory;
+            break :write_err_trace err_trace_stream.written();
+        } else null;
 
         var date_time_buf: [24]u8 = undefined;
         seq_payload.@"@t" = util.utcNowAsIsoString(self.getIo(), &date_time_buf); // timestamp
@@ -292,7 +307,7 @@ const SeqClient = struct {
 
             var serializer: json.Stringify = .{
                 .writer = &self.bytes.writer,
-                .options = .{},
+                .options = .{ .emit_null_optional_fields = false },
             };
             // write the payload body into the bytes
             serializer.write(seq_payload) catch return error.OutOfMemory;
@@ -417,7 +432,7 @@ const SeqClient = struct {
         {
             defer client.reset();
 
-            try client.writeLog(.Debug, .testing, "This is a log", .{}, @src());
+            try client.writeLog(.Debug, .testing, "This is a log", .{}, @src(), null);
             const Body = SeqBody(@TypeOf(.{}));
 
             const written: []const u8 = mem.sliceTo(client.bytes.written(), 0);
@@ -432,7 +447,7 @@ const SeqClient = struct {
         {
             defer client.reset();
 
-            try client.writeLog(.Debug, .testing, "This is a log {d}: {s}", .{ 0, "yay" }, @src());
+            try client.writeLog(.Debug, .testing, "This is a log {d}: {s}", .{ 0, "yay" }, @src(), null);
             const Body = SeqBody(@TypeOf(.{}));
 
             const written: []const u8 = mem.sliceTo(client.bytes.written(), 0);
@@ -448,7 +463,7 @@ const SeqClient = struct {
             defer client.reset();
             const args = .{ .num = 0, .message = "yay" };
 
-            try client.writeLog(.Debug, .testing, "This is a log {[num]d}: {[message]s}", args, @src());
+            try client.writeLog(.Debug, .testing, "This is a log {[num]d}: {[message]s}", args, @src(), null);
             const Body = SeqBody(@TypeOf(args));
 
             const written: []const u8 = mem.sliceTo(client.bytes.written(), 0);
@@ -466,7 +481,7 @@ const SeqClient = struct {
             defer client.reset();
             const args = .{ .num = 0, .message = "yay" };
 
-            try client.writeLog(.Debug, .testing, "This is a log {[num]d}{[num]d}: {[message]s}", args, @src());
+            try client.writeLog(.Debug, .testing, "This is a log {[num]d}{[num]d}: {[message]s}", args, @src(), null);
             const Body = SeqBody(@TypeOf(args));
 
             const written: []const u8 = mem.sliceTo(client.bytes.written(), 0);
@@ -484,7 +499,7 @@ const SeqClient = struct {
             defer client.reset();
             const args = .{ .num = 0, .message = "yay" };
 
-            try client.writeLog(.Debug, .testing, "This is a log {[num]d} {[num]d:0>4}: {[message]s}", args, @src());
+            try client.writeLog(.Debug, .testing, "This is a log {[num]d} {[num]d:0>4}: {[message]s}", args, @src(), null);
             const Body = SeqBody(@TypeOf(args));
 
             const written: []const u8 = mem.sliceTo(client.bytes.written(), 0);
@@ -570,14 +585,15 @@ fn SeqBody(comptime TBody: type) type {
             break :derived_fields .{ names, types, attrs };
         };
 
-    const field_names = added_field_names ++ derived_field_names ++ .{ "@t", "@l", "@m", "scope", "location" };
-    const field_types = added_field_types ++ derived_field_types ++ .{ []const u8, SeqLogLevel, []const u8, []const u8, []const u8 };
+    const field_names = added_field_names ++ derived_field_names ++ .{ "@t", "@l", "@m", "scope", "location", "error_trace" };
+    const field_types = added_field_types ++ derived_field_types ++ .{ []const u8, SeqLogLevel, []const u8, []const u8, []const u8, ?[]const u8 };
     const field_attrs = added_field_attrs ++ derived_field_attrs ++ [_]StructField.Attributes{
         .{ .default_value_ptr = null, .@"comptime" = false, .@"align" = @alignOf([]const u8) },
         .{ .default_value_ptr = null, .@"comptime" = false, .@"align" = @alignOf(SeqLogLevel) },
         .{ .default_value_ptr = @ptrCast(@as(*const []const u8, &"")), .@"comptime" = false, .@"align" = @alignOf([]const u8) },
         .{ .default_value_ptr = @ptrCast(@as(*const []const u8, &"")), .@"comptime" = false, .@"align" = @alignOf([]const u8) },
         .{ .default_value_ptr = @ptrCast(@as(*const []const u8, &"")), .@"comptime" = false, .@"align" = @alignOf([]const u8) },
+        .{ .default_value_ptr = @ptrCast(@as(*const ?[]const u8, &null)), .@"comptime" = false, .@"align" = @alignOf(?[]const u8) },
     };
     return @Struct(.auto, null, &field_names, &field_types, &field_attrs);
 }
@@ -613,5 +629,4 @@ const HttpRequest = HttpClient.Request;
 const HttpResponse = HttpClient.Response;
 const StructField = builtin.Type.StructField;
 const LogLevel = std.log.Level;
-const defaultStdErr = std.log.defaultLog;
 const std_log = std.log.scoped(.seq_zig);
