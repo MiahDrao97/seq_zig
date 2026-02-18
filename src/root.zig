@@ -512,6 +512,14 @@ const SeqClient = struct {
             try testing.expectEqualStrings(std.fmt.comptimePrint("{d}", .{args.num}), parsed.value.num);
             try testing.expectEqualStrings(args.message, parsed.value.message);
         }
+        {
+            defer client.reset();
+            const args = .{ .num = 0, .message = "yay" };
+
+            // below min logging level, so we shouldn't get any logs sent here
+            try client.writeLog(.Verbose, .testing, "This is a log {[num]d} {[num]d:0>4}: {[message]s}", args, @src(), null);
+            try testing.expectEqual(0, client.bytes.written().len);
+        }
     }
 };
 
