@@ -6,8 +6,6 @@
 //! ```zig
 //! // assuming imports...
 //!
-//! // assign the `seqLogFn` to the `logFn`
-//! pub const std_options: std.Options = .{ .logFn = seqLogFn };
 //! // must be mutable and public with this name
 //! pub var seq_background_worker: SeqBackgroundWorker = .init;
 //! // optionally declare additional properties to send in each log message
@@ -29,6 +27,8 @@
 //! }
 //! ```
 
+pub const log = @import("log.zig");
+
 /// Configuration on the Seq server
 pub const SeqConfig = struct {
     /// Seq server base URL we're posting logs to (with or without trailing /).
@@ -36,6 +36,12 @@ pub const SeqConfig = struct {
     base_url: []const u8,
     /// API key
     api_key: []const u8,
+    /// Minimum logging level enabled
+    minimum_level: SeqLogLevel = switch (@import("builtin").mode) {
+        .Debug => .Debug,
+        .ReleaseSafe => .Information,
+        else => .Warning,
+    },
     /// How often (in milliseconds) we flush collected logs to the Seq server.
     /// Defaults to 5K (5 seconds).
     flush_interval_ms: u32 = 5_000,
@@ -90,8 +96,7 @@ pub const SeqBackgroundWorker = struct {
     fn worker(self: *SeqBackgroundWorker, io: Io, gpa: Allocator, config: SeqConfig) void {
         self.client = SeqClient.init(io, gpa, config) catch |err| {
             if (@errorReturnTrace()) |t| debug.dumpStackTrace(t);
-            // assuming that we hijacked the log function, so we're going straight to std err
-            debug.print("FATAL: SeqBackgroundWorker cannot start: {t}\n", .{err});
+            std_log.err("FATAL: SeqBackgroundWorker cannot start: {t}", .{err});
             self.signal.store(.stopped, .seq_cst);
             return;
         };
@@ -104,26 +109,26 @@ pub const SeqBackgroundWorker = struct {
             switch (err) {
                 // any others that should kill the background thread?
                 error.OutOfMemory, error.ConnectionRefused => |e| {
-                    debug.print("FATAL: SeqBackgroundWorker encountered unrecoverable error: {t}. Returning from background thread...\n", .{e});
+                    std_log.err("FATAL: SeqBackgroundWorker encountered unrecoverable error: {t}. Returning from background thread...", .{e});
                     return;
                 },
-                else => debug.print("ERROR: SeqBackgroundWorker encountered the following error: {t}\n", .{err}),
+                else => std_log.err("ERROR: SeqBackgroundWorker encountered the following error: {t}", .{err}),
             }
         };
 
         // received sig kill
-        debug.print("Flushing Seq client...\n", .{});
+        std_log.info("Flushing Seq client...", .{});
         if (self.client.flush()) {
-            debug.print("Seq client successfully flushed all logs.\n", .{});
+            std_log.info("Seq client successfully flushed all logs.", .{});
         } else |err| {
             if (@errorReturnTrace()) |t| debug.dumpStackTrace(t);
-            debug.print("ERROR: Failed to flush Seq client on shutdown: {t}\n", .{err});
+            std_log.err("ERROR: Failed to flush Seq client on shutdown: {t}", .{err});
         }
     }
 
     fn oomKill(self: *SeqBackgroundWorker, err_return_trace: ?*builtin.StackTrace) void {
         if (err_return_trace) |t| debug.dumpStackTrace(t);
-        debug.print("FATAL: SeqBackgroundWorker ran out of memory. Killing background thread...\n", .{});
+        std_log.err("FATAL: SeqBackgroundWorker ran out of memory. Killing background thread...", .{});
         // kill the background worker
         self.signal.store(.stopped, .release);
     }
@@ -133,17 +138,26 @@ pub const SeqBackgroundWorker = struct {
 /// Assumes a public mutable global variable called "seq_background_worker" of type `SeqBackgroundWorker`.
 /// If that doesn't exist, then only the default log written to STDERR occurs.
 pub fn seqLogFn(
-    comptime level: LogLevel,
+    comptime src: builtin.SourceLocation,
+    comptime level: SeqLogLevel,
     comptime scope: @EnumLiteral(),
-    comptime log: []const u8,
+    comptime log_format: []const u8,
     args: anytype,
 ) void {
     const root = @import("root");
     if (comptime @hasDecl(root, SeqBackgroundWorker.root_decl_name) and
         @TypeOf(@field(root, SeqBackgroundWorker.root_decl_name)) == SeqBackgroundWorker)
     {
-        // still write to std err no matter what
-        defaultStdErr(level, scope, log, args);
+        // still call the std log no matter what
+        const std_level: std.log.Level = switch (level) {
+            .Verbose, .Debug => .debug,
+            .Information => .info,
+            .Warning => .warn,
+            .Error, .Fatal => .err,
+        };
+        if (comptime std.log.logEnabled(std_level, scope)) {
+            defaultStdErr(std_level, scope, log_format, args);
+        }
 
         const background_worker: *SeqBackgroundWorker = &@field(root, SeqBackgroundWorker.root_decl_name);
         // ensure that everything is initialized before proceeding
@@ -155,30 +169,7 @@ pub fn seqLogFn(
             // spin...
         }
 
-        var calling_src: ?debug.SourceLocation = null;
-        if (debug.getSelfDebugInfo()) |debug_info| {
-            // max call stack looks like:
-            // std.log.info(...)
-            // -> std.log.log(...)
-            // -> seqLogFn(...)
-            // so only 3 frames are required
-            var trace: debug.ConfigurableTrace(1, 3, true) = .init;
-            trace.addAddr(@returnAddress(), "");
-
-            const frames: []usize = mem.sliceTo(&trace.addrs[0], 0);
-            for (frames) |addr| {
-                if (debug_info.getSymbol(background_worker.client.getIo(), addr) catch null) |sym| {
-                    const src: debug.SourceLocation = @as(debug.Symbol, sym).source_location orelse continue;
-                    // skip these traces...
-                    if (!mem.endsWith(u8, src.file_name, "log.zig")) {
-                        calling_src = src;
-                        break;
-                    }
-                }
-            }
-        } else |_| {}
-
-        background_worker.client.writeLog(level, scope, log, args, calling_src) catch background_worker.oomKill(@errorReturnTrace());
+        background_worker.client.writeLog(level, scope, log_format, args, src) catch background_worker.oomKill(@errorReturnTrace());
     } else @compileError("Root source file does not declare a public global variable of type `" ++ @typeName(SeqBackgroundWorker) ++ "` named '" ++ SeqBackgroundWorker.root_decl_name ++ "'");
 }
 
@@ -246,37 +237,39 @@ const SeqClient = struct {
 
     fn writeLog(
         self: *SeqClient,
-        comptime level: LogLevel,
+        comptime level: SeqLogLevel,
         comptime scope: @EnumLiteral(),
-        comptime log: []const u8,
+        comptime log_format: []const u8,
         args: anytype,
-        location: ?debug.SourceLocation,
+        src: builtin.SourceLocation,
     ) Allocator.Error!void {
         const ArgsType = @TypeOf(args);
 
-        var src_stream: Io.Writer.Allocating = .init(self.arena.allocator());
-        defer _ = self.arena.reset(.retain_capacity);
-
-        if (location) |src| {
-            src_stream.writer.print("{s}:{d}", .{ src.file_name, src.line }) catch return error.OutOfMemory;
+        if (level.lessThan(self.config.minimum_level)) {
+            return;
         }
+
+        var src_stream: Io.Writer.Allocating = .init(self.arena.allocator());
+        defer _ = self.arena.reset(.{ .retain_with_limit = @divTrunc(self.config.log_capacity, 2) });
+
+        src_stream.writer.print("{s}.{s}<{s}>:{d}", .{
+            src.module,
+            src.file,
+            src.fn_name,
+            src.line,
+        }) catch return error.OutOfMemory;
 
         var seq_payload: SeqBody(ArgsType) = undefined;
         seq_payload.scope = @tagName(scope);
         seq_payload.location = src_stream.written();
-        seq_payload.@"@l" = switch (level) { // log level
-            .debug => .Debug,
-            .info => .Information,
-            .warn => .Warning,
-            .err => .Error,
-        };
+        seq_payload.@"@l" = level;
 
         var date_time_buf: [24]u8 = undefined;
         seq_payload.@"@t" = util.utcNowAsIsoString(self.getIo(), &date_time_buf); // timestamp
 
         if (!@typeInfo(ArgsType).@"struct".is_tuple) {
             // copy fields from args struct, which then become parameterized values given to Seq
-            const params: [@typeInfo(ArgsType).@"struct".fields.len]ParamsAndSpecifiers = parametersAndSpecifiers(log, ArgsType);
+            const params: [@typeInfo(ArgsType).@"struct".fields.len]ParamsAndSpecifiers = parametersAndSpecifiers(log_format, ArgsType);
             inline for (&params) |p| {
                 var stream: Io.Writer.Allocating = .init(self.arena.allocator());
                 stream.writer.print("{" ++ p.specifier ++ "}", .{@field(args, p.param)}) catch return error.OutOfMemory;
@@ -285,8 +278,8 @@ const SeqClient = struct {
         }
 
         // very unlikely that we'll allocate any more than this, but it's technically possible, so I don't trust a stack buffer
-        var message_stream: Io.Writer.Allocating = try .initCapacity(self.arena.allocator(), log.len);
-        message_stream.writer.print(log, args) catch return error.OutOfMemory;
+        var message_stream: Io.Writer.Allocating = try .initCapacity(self.arena.allocator(), log_format.len);
+        message_stream.writer.print(log_format, args) catch return error.OutOfMemory;
         seq_payload.@"@m" = message_stream.written();
 
         // critical section
@@ -310,7 +303,7 @@ const SeqClient = struct {
     }
 
     inline fn parametersAndSpecifiers(
-        comptime log: []const u8,
+        comptime log_format: []const u8,
         comptime TArgs: type,
     ) [@typeInfo(TArgs).@"struct".fields.len]ParamsAndSpecifiers {
         comptime {
@@ -322,12 +315,12 @@ const SeqClient = struct {
             var specifier_len: usize = 0;
             var state: enum { begin_field, arg_name, specifier, none } = .none;
 
-            outer: for (log, 0..) |char, i| switch (state) {
+            outer: for (log_format, 0..) |char, i| switch (state) {
                 .none => if (char == '{') {
                     state = .begin_field;
                 },
                 .begin_field => {
-                    debug.assert(char == '[' and i + 1 < log.len); // should be checked by comptime
+                    debug.assert(char == '[' and i + 1 < log_format.len); // should be checked by comptime
                     begin_arg_name = i + 1;
                     state = .arg_name;
                 },
@@ -344,8 +337,8 @@ const SeqClient = struct {
                             specifier_len = 0;
                             state = .none;
                         }
-                        const arg_name: []const u8 = log[begin_arg_name..][0..arg_name_len];
-                        const specifier: []const u8 = log[begin_specifier..][0..specifier_len];
+                        const arg_name: []const u8 = log_format[begin_arg_name..][0..arg_name_len];
+                        const specifier: []const u8 = log_format[begin_specifier..][0..specifier_len];
                         for (0..idx) |j| {
                             if (mem.eql(u8, arg_name, result[j].param)) continue :outer;
                         }
@@ -394,7 +387,7 @@ const SeqClient = struct {
                     Io.Reader.StreamError.WriteFailed => return error.OutOfMemory,
                     Io.Reader.StreamError.EndOfStream => {},
                 };
-                debug.print("Seq server responded with non-success code {d}: {s}\n", .{ response.head.status, stream.written() });
+                std_log.err("Seq server responded with non-success code {d}: {s}", .{ response.head.status, stream.written() });
                 return error.NonSuccessResponse;
             }
         }
@@ -424,7 +417,7 @@ const SeqClient = struct {
         {
             defer client.reset();
 
-            try client.writeLog(.debug, .testing, "This is a log", .{}, null);
+            try client.writeLog(.Debug, .testing, "This is a log", .{}, @src());
             const Body = SeqBody(@TypeOf(.{}));
 
             const written: []const u8 = mem.sliceTo(client.bytes.written(), 0);
@@ -439,7 +432,7 @@ const SeqClient = struct {
         {
             defer client.reset();
 
-            try client.writeLog(.debug, .testing, "This is a log {d}: {s}", .{ 0, "yay" }, null);
+            try client.writeLog(.Debug, .testing, "This is a log {d}: {s}", .{ 0, "yay" }, @src());
             const Body = SeqBody(@TypeOf(.{}));
 
             const written: []const u8 = mem.sliceTo(client.bytes.written(), 0);
@@ -455,7 +448,7 @@ const SeqClient = struct {
             defer client.reset();
             const args = .{ .num = 0, .message = "yay" };
 
-            try client.writeLog(.debug, .testing, "This is a log {[num]d}: {[message]s}", args, null);
+            try client.writeLog(.Debug, .testing, "This is a log {[num]d}: {[message]s}", args, @src());
             const Body = SeqBody(@TypeOf(args));
 
             const written: []const u8 = mem.sliceTo(client.bytes.written(), 0);
@@ -473,7 +466,7 @@ const SeqClient = struct {
             defer client.reset();
             const args = .{ .num = 0, .message = "yay" };
 
-            try client.writeLog(.debug, .testing, "This is a log {[num]d}{[num]d}: {[message]s}", args, null);
+            try client.writeLog(.Debug, .testing, "This is a log {[num]d}{[num]d}: {[message]s}", args, @src());
             const Body = SeqBody(@TypeOf(args));
 
             const written: []const u8 = mem.sliceTo(client.bytes.written(), 0);
@@ -491,7 +484,7 @@ const SeqClient = struct {
             defer client.reset();
             const args = .{ .num = 0, .message = "yay" };
 
-            try client.writeLog(.debug, .testing, "This is a log {[num]d} {[num]d:0>4}: {[message]s}", args, null);
+            try client.writeLog(.Debug, .testing, "This is a log {[num]d} {[num]d:0>4}: {[message]s}", args, @src());
             const Body = SeqBody(@TypeOf(args));
 
             const written: []const u8 = mem.sliceTo(client.bytes.written(), 0);
@@ -509,8 +502,26 @@ const SeqClient = struct {
 
 const LogIndex = enum(u32) { _ };
 
-/// TODO : It would be nice if we could do one-off overrides of the Seq log level instead of derriving it from the Zig log level
-pub const SeqLogLevel = enum { Verbose, Debug, Information, Warning, Error, Fatal };
+/// Log levels as determined by [Seq](https://datalust.co/docs/posting-raw-events)
+pub const SeqLogLevel = enum(u8) {
+    /// Also known as "trace" logging
+    /// This is info that would be logged when a --verbose flag is passed in, logging everything imaginable
+    Verbose = 0,
+    /// One level above verbose
+    Debug = 1,
+    /// Normal information-level logging for normal operations
+    Information = 2,
+    /// Give an indication that data or some expected conditions are off, which may be a sign of an error or bug
+    Warning = 3,
+    /// Error, presumably one that does not result in application exit
+    Error = 4,
+    /// Error that results in application exit
+    Fatal = 5,
+
+    fn lessThan(a: SeqLogLevel, b: SeqLogLevel) bool {
+        return @intFromEnum(a) < @intFromEnum(b);
+    }
+};
 
 fn SeqBody(comptime TBody: type) type {
     // additional props declared at root
@@ -603,3 +614,4 @@ const HttpResponse = HttpClient.Response;
 const StructField = builtin.Type.StructField;
 const LogLevel = std.log.Level;
 const defaultStdErr = std.log.defaultLog;
+const std_log = std.log.scoped(.seq_zig);
