@@ -87,7 +87,7 @@ pub const SeqBackgroundWorker = struct {
     /// For a clean shutdown, this sends a kill signal to the background thread.
     /// Flushes all logs on shutdown.
     pub fn shutdown(self: *SeqBackgroundWorker) void {
-        self.signal.store(.stopped, .seq_cst);
+        self.signal.store(.stopped, .release);
         self.thread.join();
         // client is created and cleaned up in the background thread; don't want to attempt to deinit() something that could be undefined
         self.* = undefined;
@@ -97,14 +97,14 @@ pub const SeqBackgroundWorker = struct {
         self.client = SeqClient.init(io, gpa, config) catch |err| {
             if (@errorReturnTrace()) |t| debug.dumpStackTrace(t);
             std_log.err("FATAL: SeqBackgroundWorker cannot start: {t}", .{err});
-            self.signal.store(.stopped, .seq_cst);
+            self.signal.store(.stopped, .release);
             return;
         };
         defer self.client.deinit(gpa);
 
         // everything is initialized!
-        self.signal.store(.running, .seq_cst);
-        while (self.signal.load(.monotonic) == .running) self.client.evaluate() catch |err| {
+        self.signal.store(.running, .release);
+        while (self.signal.load(.acquire) == .running) self.client.evaluate() catch |err| {
             if (@errorReturnTrace()) |t| debug.dumpStackTrace(t);
             switch (err) {
                 // any others that should kill the background thread?
@@ -136,13 +136,13 @@ pub const SeqBackgroundWorker = struct {
 
 /// Assumes a public mutable global variable called "seq_background_worker" of type `SeqBackgroundWorker`.
 /// Also calls `std.options.logFn` so whichever log function override you provide will still be respected.
-pub fn seqLogFn(
+pub fn seqLog(
     comptime src: builtin.SourceLocation,
+    err_return_trace: ?*const builtin.StackTrace,
     comptime level: SeqLogLevel,
     comptime scope: @EnumLiteral(),
     comptime log_format: []const u8,
     args: anytype,
-    err_return_trace: ?*const builtin.StackTrace,
 ) void {
     const root = @import("root");
     if (comptime @hasDecl(root, SeqBackgroundWorker.root_decl_name) and
@@ -161,7 +161,7 @@ pub fn seqLogFn(
 
         const background_worker: *SeqBackgroundWorker = &@field(root, SeqBackgroundWorker.root_decl_name);
         // ensure that everything is initialized before proceeding
-        while (switch (background_worker.signal.load(.monotonic)) {
+        while (switch (background_worker.signal.load(.acquire)) {
             .staged => true,
             .running => false,
             .stopped => return,
@@ -249,7 +249,7 @@ const SeqClient = struct {
         comptime log_format: []const u8,
         args: anytype,
         src: builtin.SourceLocation,
-        err_return_trace: ?*const builtin.StackTrace,
+        stack_trace: ?*const builtin.StackTrace,
     ) Allocator.Error!void {
         const ArgsType = @TypeOf(args);
 
@@ -271,7 +271,7 @@ const SeqClient = struct {
         seq_payload.scope = @tagName(scope);
         seq_payload.location = src_stream.written();
         seq_payload.@"@l" = level;
-        seq_payload.error_trace = if (err_return_trace) |err_trace| write_err_trace: {
+        seq_payload.error_trace = if (stack_trace) |err_trace| write_err_trace: {
             var err_trace_stream: Io.Writer.Allocating = .init(self.arena.allocator());
             const terminal: Io.Terminal = .{ .writer = &err_trace_stream.writer, .mode = .no_color };
 
