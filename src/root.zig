@@ -267,20 +267,22 @@ const SeqClient = struct {
             src.line,
         }) catch return error.OutOfMemory;
 
-        var seq_payload: SeqBody(ArgsType) = undefined;
-        seq_payload.scope = @tagName(scope);
-        seq_payload.location = src_stream.written();
-        seq_payload.@"@l" = level;
-        seq_payload.error_trace = if (stack_trace) |err_trace| write_err_trace: {
-            var err_trace_stream: Io.Writer.Allocating = .init(self.arena.allocator());
-            const terminal: Io.Terminal = .{ .writer = &err_trace_stream.writer, .mode = .no_color };
+        var seq_payload: SeqBody(ArgsType) = .{
+            .scope = @tagName(scope),
+            .location = src_stream.written(),
+            .stack_trace = if (stack_trace) |err_trace| write_trace: {
+                var err_trace_stream: Io.Writer.Allocating = .init(self.arena.allocator());
+                const terminal: Io.Terminal = .{ .writer = &err_trace_stream.writer, .mode = .no_color };
 
-            debug.writeStackTrace(err_trace, terminal) catch return error.OutOfMemory;
-            break :write_err_trace err_trace_stream.written();
-        } else null;
-
-        var date_time_buf: [24]u8 = undefined;
-        seq_payload.@"@t" = util.utcNowAsIsoString(self.getIo(), &date_time_buf); // timestamp
+                debug.writeStackTrace(err_trace, terminal) catch return error.OutOfMemory;
+                break :write_trace err_trace_stream.written();
+            } else null,
+            .@"@l" = level,
+            .@"@t" = timestamp: {
+                var date_time_buf: [24]u8 = undefined;
+                break :timestamp util.utcNowAsIsoString(self.getIo(), &date_time_buf);
+            },
+        };
 
         if (!@typeInfo(ArgsType).@"struct".is_tuple) {
             // copy fields from args struct, which then become parameterized values given to Seq
@@ -594,7 +596,7 @@ fn SeqBody(comptime TBody: type) type {
             break :derived_fields .{ names, types, attrs };
         };
 
-    const field_names = added_field_names ++ derived_field_names ++ .{ "@t", "@l", "@m", "scope", "location", "error_trace" };
+    const field_names = added_field_names ++ derived_field_names ++ .{ "@t", "@l", "@m", "scope", "location", "stack_trace" };
     const field_types = added_field_types ++ derived_field_types ++ .{ []const u8, SeqLogLevel, []const u8, []const u8, []const u8, ?[]const u8 };
     const field_attrs = added_field_attrs ++ derived_field_attrs ++ [_]StructField.Attributes{
         .{ .default_value_ptr = null, .@"comptime" = false, .@"align" = @alignOf([]const u8) },
@@ -610,11 +612,6 @@ fn SeqBody(comptime TBody: type) type {
 comptime {
     // unit-test non-pub structs
     _ = SeqClient;
-}
-
-fn getSrc(io: Io, debug_info: *debug.SelfInfo, addr: usize) debug.SelfInfoError!?debug.SourceLocation {
-    const symbol: debug.Symbol = try debug_info.getSymbol(io, addr);
-    return symbol.source_location;
 }
 
 const ingestion_path = "/ingest/clef";

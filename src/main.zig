@@ -5,6 +5,7 @@ pub var seq_background_worker: SeqBackgroundWorker = .init;
 /// Additional properties to add to every log (optional)
 pub const additional_log_props = .{
     .application = "Zig Test App",
+    .version = 1.2,
 };
 
 pub fn main(init: std.process.Init) !void {
