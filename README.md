@@ -7,7 +7,7 @@ NOTE : Minimum version is Zig master `0.16.0-dev.2565+684032671`.
 
 Fetch via `zig` CLI:
 ```
-zig fetch https://github.com/MiahDrao97/seq_zig/archive/main.tar.gz --save
+zig fetch https://github.com/MiahDrao97/seq_zig/archive/master.tar.gz --save
 ```
 
 And then add the import in your `build.zig`:
