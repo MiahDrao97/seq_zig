@@ -257,19 +257,18 @@ const SeqClient = struct {
             return;
         }
 
-        var src_stream: Io.Writer.Allocating = .init(self.arena.allocator());
         defer _ = self.arena.reset(.{ .retain_with_limit = @divTrunc(self.config.log_capacity, 2) });
-
-        src_stream.writer.print("{s}.{s}<{s}>:{d}", .{
-            src.module,
-            src.file,
-            src.fn_name,
-            src.line,
-        }) catch return error.OutOfMemory;
 
         var seq_payload: SeqBody(ArgsType) = .{
             .scope = @tagName(scope),
-            .location = src_stream.written(),
+            .location = write_location: {
+                var src_stream: Io.Writer.Allocating = .init(self.arena.allocator());
+                src_stream.writer.print(
+                    "{s}.{s}<{s}>:{d}",
+                    .{ src.module, src.file, src.fn_name, src.line },
+                ) catch return error.OutOfMemory;
+                break :write_location src_stream.written();
+            },
             .stack_trace = if (stack_trace) |st| write_trace: {
                 var st_stream: Io.Writer.Allocating = .init(self.arena.allocator());
                 const terminal: Io.Terminal = .{ .writer = &st_stream.writer, .mode = .no_color };
