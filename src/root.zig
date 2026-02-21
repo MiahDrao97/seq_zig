@@ -270,12 +270,12 @@ const SeqClient = struct {
         var seq_payload: SeqBody(ArgsType) = .{
             .scope = @tagName(scope),
             .location = src_stream.written(),
-            .stack_trace = if (stack_trace) |err_trace| write_trace: {
-                var err_trace_stream: Io.Writer.Allocating = .init(self.arena.allocator());
-                const terminal: Io.Terminal = .{ .writer = &err_trace_stream.writer, .mode = .no_color };
+            .stack_trace = if (stack_trace) |st| write_trace: {
+                var st_stream: Io.Writer.Allocating = .init(self.arena.allocator());
+                const terminal: Io.Terminal = .{ .writer = &st_stream.writer, .mode = .no_color };
 
-                debug.writeStackTrace(err_trace, terminal) catch return error.OutOfMemory;
-                break :write_trace err_trace_stream.written();
+                debug.writeStackTrace(st, terminal) catch return error.OutOfMemory;
+                break :write_trace st_stream.written();
             } else null,
             .@"@l" = level,
             .@"@t" = timestamp: {
