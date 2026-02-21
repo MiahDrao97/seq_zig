@@ -18,7 +18,7 @@
 //!
 //!     try seq_background_worker.start(io, gpa, .{
 //!         // fill these in for your Seq server url and API key...
-//!         .url = undefined,
+//!         .url = "http://localhost:5341",
 //!         .api_key = "",
 //!     });
 //!     defer seq_background_worker.shutdown();
@@ -138,7 +138,7 @@ pub const SeqBackgroundWorker = struct {
 /// Also calls `std.options.logFn` so whichever log function override you provide will still be respected.
 pub fn seqLog(
     comptime src: builtin.SourceLocation,
-    err_return_trace: ?*const builtin.StackTrace,
+    stack_trace: ?*const builtin.StackTrace,
     comptime level: SeqLogLevel,
     comptime scope: @EnumLiteral(),
     comptime log_format: []const u8,
@@ -170,12 +170,12 @@ pub fn seqLog(
         }
 
         background_worker.client.writeLog(
+            src,
+            stack_trace,
             level,
             scope,
             log_format,
             args,
-            src,
-            err_return_trace,
         ) catch background_worker.oomKill(@errorReturnTrace());
     } else @compileError("Root source file does not declare a public global variable of type `" ++ @typeName(SeqBackgroundWorker) ++ "` named '" ++ SeqBackgroundWorker.root_decl_name ++ "'");
 }
@@ -244,12 +244,12 @@ const SeqClient = struct {
 
     fn writeLog(
         self: *SeqClient,
+        src: builtin.SourceLocation,
+        stack_trace: ?*const builtin.StackTrace,
         comptime level: SeqLogLevel,
         comptime scope: @EnumLiteral(),
         comptime log_format: []const u8,
         args: anytype,
-        src: builtin.SourceLocation,
-        stack_trace: ?*const builtin.StackTrace,
     ) Allocator.Error!void {
         const ArgsType = @TypeOf(args);
 
@@ -384,6 +384,7 @@ const SeqClient = struct {
             var request: HttpRequest = try self.connection.request(.POST, self.seq_ingestion_endpoint, .{
                 .headers = .{
                     .authorization = .{ .override = self.config.api_key },
+                    .content_type = .{ .override = "application/json" },
                 },
             });
             defer request.deinit();
@@ -432,7 +433,7 @@ const SeqClient = struct {
         {
             defer client.reset();
 
-            try client.writeLog(.Debug, .testing, "This is a log", .{}, @src(), null);
+            try client.writeLog(@src(), null, .Debug, .testing, "This is a log", .{});
             const Body = SeqBody(@TypeOf(.{}));
 
             const written: []const u8 = mem.sliceTo(client.bytes.written(), 0);
@@ -447,7 +448,7 @@ const SeqClient = struct {
         {
             defer client.reset();
 
-            try client.writeLog(.Debug, .testing, "This is a log {d}: {s}", .{ 0, "yay" }, @src(), null);
+            try client.writeLog(@src(), null, .Debug, .testing, "This is a log {d}: {s}", .{ 0, "yay" });
             const Body = SeqBody(@TypeOf(.{}));
 
             const written: []const u8 = mem.sliceTo(client.bytes.written(), 0);
@@ -463,7 +464,7 @@ const SeqClient = struct {
             defer client.reset();
             const args = .{ .num = 0, .message = "yay" };
 
-            try client.writeLog(.Debug, .testing, "This is a log {[num]d}: {[message]s}", args, @src(), null);
+            try client.writeLog(@src(), null, .Debug, .testing, "This is a log {[num]d}: {[message]s}", args);
             const Body = SeqBody(@TypeOf(args));
 
             const written: []const u8 = mem.sliceTo(client.bytes.written(), 0);
@@ -481,7 +482,7 @@ const SeqClient = struct {
             defer client.reset();
             const args = .{ .num = 0, .message = "yay" };
 
-            try client.writeLog(.Debug, .testing, "This is a log {[num]d}{[num]d}: {[message]s}", args, @src(), null);
+            try client.writeLog(@src(), null, .Debug, .testing, "This is a log {[num]d}{[num]d}: {[message]s}", args);
             const Body = SeqBody(@TypeOf(args));
 
             const written: []const u8 = mem.sliceTo(client.bytes.written(), 0);
@@ -499,7 +500,7 @@ const SeqClient = struct {
             defer client.reset();
             const args = .{ .num = 0, .message = "yay" };
 
-            try client.writeLog(.Debug, .testing, "This is a log {[num]d} {[num]d:0>4}: {[message]s}", args, @src(), null);
+            try client.writeLog(@src(), null, .Debug, .testing, "This is a log {[num]d} {[num]d:0>4}: {[message]s}", args);
             const Body = SeqBody(@TypeOf(args));
 
             const written: []const u8 = mem.sliceTo(client.bytes.written(), 0);
@@ -517,7 +518,7 @@ const SeqClient = struct {
             const args = .{ .num = 0, .message = "yay" };
 
             // below min logging level, so we shouldn't get any logs sent here
-            try client.writeLog(.Verbose, .testing, "This is a log {[num]d} {[num]d:0>4}: {[message]s}", args, @src(), null);
+            try client.writeLog(@src(), null, .Verbose, .testing, "This is a log {[num]d} {[num]d:0>4}: {[message]s}", args);
             try testing.expectEqual(0, client.bytes.written().len);
         }
     }
