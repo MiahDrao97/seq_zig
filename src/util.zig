@@ -36,15 +36,26 @@ pub fn utcNowAsIsoString(io: Io, buf: *[24]u8) []const u8 {
 /// Not in use
 /// Test before putting in place with the SeqClient
 pub const RingBuf = struct {
+    /// The bytes themselves
     bytes: []u8,
+    /// The reader's location
     r_loc: Loc,
+    /// The writer's location
     w_loc: Loc,
+    /// Moves to the left when a chunk of data is too large for the rest of the buffer
+    /// Indicates that we're wrapping around
+    watermark: Atomic(u32),
+
+    //      |______________________________|
+    //      ^                              ^
+    // r_loc, w_loc                    watermark
 
     pub fn init(gpa: Allocator, size: u32) Allocator.Error!RingBuf {
         return .{
             .bytes = try gpa.alloc(u8, size),
             .r_loc = .{},
             .w_loc = .{},
+            .watermark = .init(size),
         };
     }
 
@@ -52,6 +63,10 @@ pub const RingBuf = struct {
         gpa.free(self.bytes);
         self.* = undefined;
     }
+
+    //      |========|_____________________|
+    //      ^        ^                     ^
+    //    r_loc    w_loc                watermark
 
     pub fn reader(self: *RingBuf) error{Empty}!Reader {
         const head: u32 = self.r_loc.start.raw;
@@ -67,6 +82,10 @@ pub const RingBuf = struct {
         const len: u32 = tail -% head;
         return .init(self, head, len);
     }
+
+    // |____|====================|_________|
+    //      ^                    ^         ^
+    //    r_loc                w_loc   watermark
 
     pub fn writer(self: *RingBuf) error{NoSpace}!Writer {
         const tail: u32 = self.w_loc.start.raw;
@@ -165,6 +184,13 @@ pub const RingBuf = struct {
                     self.ring.w_loc.safe_end = self.safe_end;
                 }
                 if (self.ring.bytes.len - self.pos < data.len) {
+
+                    // move the watermark left:
+                    // Once the reader hits the watermark, it'll get set back to the far right.
+                    // |====|------------|================|XXXXX|
+                    //      ^            ^                ^
+                    //    w_loc        r_loc          watermark
+
                     const remaining: u32 = @intCast(data.len - (self.ring.bytes.len - self.pos));
                     @memcpy(self.ring.bytes[self.pos..], datum[0 .. datum.len - remaining]);
                     @memcpy(self.ring.bytes[0..remaining], datum[remaining..]);
