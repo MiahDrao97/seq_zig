@@ -35,16 +35,20 @@ pub fn utcNowAsIsoString(io: Io, buf: *[24]u8) []const u8 {
 /// FIXME :
 /// Not in use
 /// Test before putting in place with the SeqClient
+/// 1 reader; multiple writers
 pub const RingBuf = struct {
     /// The bytes themselves
     bytes: []u8,
     /// The reader's location
-    r_loc: Loc,
+    r_loc: Atomic(u32),
     /// The writer's location
-    w_loc: Loc,
+    w_loc: Atomic(u32),
     /// Moves to the left when a chunk of data is too large for the rest of the buffer
     /// Indicates that we're wrapping around
     watermark: Atomic(u32),
+    // TODO : Member to deliniate the separations of aggregated logs.
+    // We write in chunks and we want the reader to pick up those same chunks.
+    // This memory won't move during the lifetime of this buffer, so we can safely store pointers to specific bytes.
 
     //      |______________________________|
     //      ^                              ^
@@ -53,8 +57,8 @@ pub const RingBuf = struct {
     pub fn init(gpa: Allocator, size: u32) Allocator.Error!RingBuf {
         return .{
             .bytes = try gpa.alloc(u8, size),
-            .r_loc = .{},
-            .w_loc = .{},
+            .r_loc = .init(0),
+            .w_loc = .init(0),
             .watermark = .init(size),
         };
     }
@@ -66,21 +70,22 @@ pub const RingBuf = struct {
 
     //      |========|_____________________|
     //      ^        ^                     ^
-    //    r_loc    w_loc                watermark
+    //    r_loc    w_loc               watermark
 
     pub fn reader(self: *RingBuf) error{Empty}!Reader {
-        const head: u32 = self.r_loc.start.raw;
-        var tail: u32 = self.r_loc.safe_end;
+        const head: u32 = self.w_loc.load(.monotonic);
+        var tail: u32 = self.r_loc.raw;
 
         // assuming this is empty
         if (head == tail) {
-            tail = self.w_loc.start.load(.acquire);
+            // check again
+            tail = self.w_loc.load(.acquire);
             if (head == tail) return error.Empty;
-            self.r_loc.safe_end = tail;
         }
 
         const len: u32 = tail -% head;
-        return .init(self, head, len);
+        _ = len;
+        return .init(self);
     }
 
     // |____|====================|_________|
@@ -88,128 +93,36 @@ pub const RingBuf = struct {
     //    r_loc                w_loc   watermark
 
     pub fn writer(self: *RingBuf) error{NoSpace}!Writer {
-        const tail: u32 = self.w_loc.start.raw;
-        var head: u32 = self.w_loc.safe_end;
+        const tail: u32 = self.r_loc.load(.monotonic);
+        var head: u32 = self.w_loc.raw;
 
         // assuming this is empty
         if (head == tail) {
-            head = self.r_loc.start.load(.acquire);
+            head = self.w_loc.load(.acquire);
             if (head == tail) return error.NoSpace;
-            self.w_loc.safe_end = head;
         }
 
-        return .init(self, tail, head);
+        return .init(self);
     }
 
     /// The reader interface never returns `error.ReadFailed`
     pub const Reader = struct {
         ring: *RingBuf,
-        offset: u32,
-        len: u32,
-        read_complete: bool,
-        interface: Io.Reader,
+        // TODO:
 
-        const vtable: Io.Reader.VTable = .{
-            .stream = stream,
-        };
-
-        fn init(ring: *RingBuf, offset: u32, len: u32) Reader {
-            return .{
-                .ring = ring,
-                .offset = offset,
-                .len = len,
-                .read_complete = false,
-                .interface = .{
-                    .buffer = &.{},
-                    .end = 0,
-                    .seek = 0,
-                    .vtable = &vtable,
-                },
-            };
-        }
-
-        fn stream(r: *Io.Reader, w: *Io.Writer, limit: Io.Limit) Io.Reader.StreamError!usize {
-            const self: *Reader = @fieldParentPtr("interface", r);
-            if (self.read_complete) return error.EndOfStream;
-            const l: usize = @min(self.len, @intFromEnum(limit));
-            if (self.offset + l > self.ring.bytes.len) {
-                // we're wrapping around, so this requires up to 2 writes
-                try w.write(self.ring.bytes[self.offset..]);
-                const remaining: u32 = @intCast(l - (self.ring.bytes.len - self.offset));
-                if (remaining > 0) {
-                    try w.write(self.ring.bytes[0..remaining]);
-                }
-                self.ring.w_loc.start.store(remaining, .release);
-            } else {
-                try w.write(self.ring.bytes[self.offset..][0..l]);
-                self.ring.w_loc.start.store(@intCast(self.offset + l), .release);
-            }
-            self.read_complete = true;
-            return l;
+        fn init(ring: *RingBuf) Reader {
+            return .{ .ring = ring };
         }
     };
 
     /// `error.WriteFailed` indicates the buffer is full (i.e. would overtake the reader position)
     pub const Writer = struct {
         ring: *RingBuf,
-        pos: u32,
-        safe_end: u32,
-        interface: Io.Writer,
+        // TODO:
 
-        const vtable: Io.Writer.VTable = .{
-            .drain = drain,
-        };
-
-        fn init(ring: *RingBuf, offset: u32, safe_end: u32) Writer {
-            return .{
-                .ring = ring,
-                .pos = offset,
-                .safe_end = safe_end,
-                .interface = .{
-                    .buffer = &.{},
-                    .vtable = &vtable,
-                },
-            };
+        fn init(ring: *RingBuf) Writer {
+            return .{ .ring = ring };
         }
-
-        fn drain(w: *Io.Writer, data: []const []const u8, splat: usize) Io.Writer.Error!usize {
-            const self: *Writer = @fieldParentPtr("interface", w);
-            _ = splat;
-
-            var written: usize = 0;
-            for (data) |datum| {
-                if (self.safe_end -% self.pos <= datum.len) {
-                    self.safe_end = self.ring.r_loc.start.load(.acquire);
-                    if (self.safe_end -% self.pos <= datum.len) return error.WriteFailed;
-                    self.ring.w_loc.safe_end = self.safe_end;
-                }
-                if (self.ring.bytes.len - self.pos < data.len) {
-
-                    // move the watermark left:
-                    // Once the reader hits the watermark, it'll get set back to the far right.
-                    // |====|------------|================|XXXXX|
-                    //      ^            ^                ^
-                    //    w_loc        r_loc          watermark
-
-                    const remaining: u32 = @intCast(data.len - (self.ring.bytes.len - self.pos));
-                    @memcpy(self.ring.bytes[self.pos..], datum[0 .. datum.len - remaining]);
-                    @memcpy(self.ring.bytes[0..remaining], datum[remaining..]);
-                    self.pos = remaining;
-                } else {
-                    @memcpy(self.ring.bytes[self.pos..datum.len], datum);
-                    self.pos += @as(u32, @intCast(datum.len));
-                }
-                self.ring.w_loc.start.store(self.pos, .release);
-                written += datum.len;
-            }
-
-            return written;
-        }
-    };
-
-    const Loc = struct {
-        start: Atomic(u32) = .init(0),
-        safe_end: u32 = 0,
     };
 };
 
@@ -217,6 +130,7 @@ const std = @import("std");
 const Io = std.Io;
 const Allocator = std.mem.Allocator;
 const Atomic = std.atomic.Value;
+const SinglyLinkedList = std.SinglyLinkedList;
 const EpochSeconds = std.time.epoch.EpochSeconds;
 const EpochDay = std.time.epoch.EpochDay;
 const YearAndDay = std.time.epoch.YearAndDay;

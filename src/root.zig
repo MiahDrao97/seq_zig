@@ -379,6 +379,8 @@ const SeqClient = struct {
         self.mutex.lockUncancelable(self.getIo());
         defer self.mutex.unlock(self.getIo());
 
+        // OPTIMIZE : This can be batched, provided that each JSON body is newline-delimited
+        // https://datalust.co/docs/posting-raw-events
         for (self.indices.items) |idx| {
             // these should be the JSON bodies prepared to be sent
             const entry: []u8 = mem.sliceTo(self.bytes.written()[@intFromEnum(idx)..], 0);
