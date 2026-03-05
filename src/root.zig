@@ -188,8 +188,6 @@ const SeqClient = struct {
     seq_endpoint_raw: []const u8,
     /// Interned JSON payloads to be sent to the Seq server
     bytes: Io.Writer.Allocating,
-    /// Offsets with the contiguous region of `bytes`, indicating the start of a new JSON payload until the next null byte
-    indices: ArrayList(LogIndex),
     /// Arena for scratch space as needed
     arena: ArenaAllocator,
     /// Http client
@@ -219,9 +217,7 @@ const SeqClient = struct {
         @memcpy(uri_raw[0..base_url.len], base_url);
         @memcpy(uri_raw[base_url.len..], ingestion_path);
 
-        var indices: ArrayList(LogIndex) = try .initCapacity(gpa, @divTrunc(config.log_capacity, 2));
-        errdefer indices.deinit(gpa);
-
+        // allocate more than the log capacity to reduce the chance of having to realloc in the event of exceeding the log capacity
         var bytes: Io.Writer.Allocating = try .initCapacity(gpa, @intFromFloat(@as(f64, @floatFromInt(config.log_capacity)) * 1.5));
         errdefer bytes.deinit();
 
@@ -229,7 +225,6 @@ const SeqClient = struct {
             .seq_ingestion_endpoint = try .parse(uri_raw),
             .seq_endpoint_raw = uri_raw,
             .bytes = bytes,
-            .indices = indices,
             .arena = .init(gpa),
             .connection = .{ .io = io, .allocator = gpa },
             .config = config,
@@ -303,8 +298,10 @@ const SeqClient = struct {
             self.mutex.lockUncancelable(self.getIo());
             defer self.mutex.unlock(self.getIo());
 
-            const offset: LogIndex = @enumFromInt(self.bytes.written().len);
-            try self.indices.append(self.bytes.allocator, offset);
+            if (self.bytes.written().len > 0) {
+                // prepend a newline
+                self.bytes.writer.writeByte('\n') catch return error.OutOfMemory;
+            }
 
             var serializer: json.Stringify = .{
                 .writer = &self.bytes.writer,
@@ -312,9 +309,6 @@ const SeqClient = struct {
             };
             // write the payload body into the bytes
             serializer.write(seq_payload) catch return error.OutOfMemory;
-
-            // append a null byte at the end
-            self.bytes.writer.writeByte(0) catch return error.OutOfMemory;
         }
     }
 
@@ -379,43 +373,39 @@ const SeqClient = struct {
         self.mutex.lockUncancelable(self.getIo());
         defer self.mutex.unlock(self.getIo());
 
-        // OPTIMIZE : This can be batched, provided that each JSON body is newline-delimited
-        // https://datalust.co/docs/posting-raw-events
-        for (self.indices.items) |idx| {
-            // these should be the JSON bodies prepared to be sent
-            const entry: []u8 = mem.sliceTo(self.bytes.written()[@intFromEnum(idx)..], 0);
-            var request: HttpRequest = try self.connection.request(.POST, self.seq_ingestion_endpoint, .{
-                .headers = .{
-                    .authorization = .{ .override = self.config.api_key },
-                    .content_type = .{ .override = "application/json" },
-                },
-            });
-            defer request.deinit();
+        // these should be newline-delimited JSON bodies prepared to be sent in a single batch
+        // see: https://datalust.co/docs/posting-raw-events
+        const entries: []u8 = self.bytes.written();
+        var request: HttpRequest = try self.connection.request(.POST, self.seq_ingestion_endpoint, .{
+            .headers = .{
+                .authorization = .{ .override = self.config.api_key },
+                .content_type = .{ .override = "application/vnd.serilog.clef" },
+            },
+        });
+        defer request.deinit();
 
-            try request.sendBodyComplete(entry);
-            var buf: struct { redirect: [1024]u8, resp_body: [1024]u8 } = undefined;
-            var response: HttpResponse = try request.receiveHead(&buf.redirect);
-            if (response.head.status.class() != .success) {
-                const reader: *Io.Reader = response.reader(&buf.resp_body);
+        try request.sendBodyComplete(entries);
+        var buf: struct { redirect: [1024]u8, resp_body: [1024]u8 } = undefined;
+        var response: HttpResponse = try request.receiveHead(&buf.redirect);
+        if (response.head.status.class() != .success) {
+            const reader: *Io.Reader = response.reader(&buf.resp_body);
 
-                var stream: Io.Writer.Allocating = .init(self.bytes.allocator);
-                defer stream.deinit();
+            var stream: Io.Writer.Allocating = .init(self.bytes.allocator);
+            defer stream.deinit();
 
-                _ = reader.stream(&stream.writer, .unlimited) catch |err| switch (err) {
-                    Io.Reader.StreamError.ReadFailed => return response.bodyErr().?,
-                    Io.Reader.StreamError.WriteFailed => return error.OutOfMemory,
-                    Io.Reader.StreamError.EndOfStream => {},
-                };
-                std_log.err("Seq server responded with non-success code {d}: {s}", .{ response.head.status, stream.written() });
-                return error.NonSuccessResponse;
-            }
+            _ = reader.stream(&stream.writer, .unlimited) catch |err| switch (err) {
+                Io.Reader.StreamError.ReadFailed => return response.bodyErr().?,
+                Io.Reader.StreamError.WriteFailed => return error.OutOfMemory,
+                Io.Reader.StreamError.EndOfStream => {},
+            };
+            std_log.err("Seq server responded with non-success code {d}: {s}", .{ response.head.status, stream.written() });
+            return error.NonSuccessResponse;
         }
         self.reset();
     }
 
     fn reset(self: *SeqClient) void {
         self.bytes.clearRetainingCapacity();
-        self.indices.clearRetainingCapacity();
         self.last_flush = .now(self.getIo(), .real);
     }
 
@@ -423,7 +413,6 @@ const SeqClient = struct {
         gpa.free(self.seq_endpoint_raw);
         self.connection.deinit();
         self.bytes.deinit();
-        self.indices.deinit(gpa);
         self.arena.deinit();
         self.* = undefined;
     }
