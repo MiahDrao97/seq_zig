@@ -37,6 +37,5 @@ const log = seq_zig.log.scoped(.integration_test);
 const Io = std.Io;
 const SeqBackgroundWorker = seq_zig.SeqBackgroundWorker;
 const SeqConfig = seq_zig.SeqConfig;
-const seqLogFn = seq_zig.seqLogFn;
 const Allocator = std.mem.Allocator;
 const DebugAllocator = std.heap.DebugAllocator;

@@ -112,7 +112,7 @@ pub const SeqBackgroundWorker = struct {
                     std_log.err("FATAL: SeqBackgroundWorker encountered unrecoverable error: {t}. Returning from background thread...", .{e});
                     return;
                 },
-                else => std_log.err("ERROR: SeqBackgroundWorker encountered the following error: {t}", .{err}),
+                else => std_log.err("SeqBackgroundWorker encountered the following error: {t}", .{err}),
             }
         };
 
@@ -122,7 +122,7 @@ pub const SeqBackgroundWorker = struct {
             std_log.info("Seq client successfully flushed all logs.", .{});
         } else |err| {
             if (@errorReturnTrace()) |t| debug.dumpStackTrace(t);
-            std_log.err("ERROR: Failed to flush Seq client on shutdown: {t}", .{err});
+            std_log.err("Failed to flush Seq client on shutdown: {t}", .{err});
         }
     }
 
