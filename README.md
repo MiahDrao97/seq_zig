@@ -4,6 +4,13 @@ Sends logs from a Zig application to a [Seq](https://datalust.co/) server for st
 
 ## Installation
 Fetch via `zig` CLI:
+
+v0.1.0, which is compatible with Zig 0.16.0:
+```
+zig fetch https://github.com/MiahDrao97/seq_zig/archive/refs/tags/v0.1.0.tar.gz --save
+```
+
+Master:
 ```
 zig fetch https://github.com/MiahDrao97/seq_zig/archive/master.tar.gz --save
 ```
