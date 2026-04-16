@@ -220,7 +220,7 @@ const SeqClient = struct {
         @memcpy(uri_raw[base_url.len..], ingestion_path);
 
         // allocate more than the log capacity to reduce the chance of having to realloc in the event of exceeding the log capacity
-        var bytes: Io.Writer.Allocating = try .initCapacity(gpa, @intFromFloat(@as(f64, @floatFromInt(config.log_capacity)) * 1.5));
+        var bytes: Io.Writer.Allocating = try .initCapacity(gpa, @trunc(@as(f64, config.log_capacity) * 1.5));
         errdefer bytes.deinit();
 
         return .{
