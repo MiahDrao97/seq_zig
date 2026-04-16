@@ -18,11 +18,11 @@ pub fn main(init: std.process.Init) !void {
     });
     defer seq_background_worker.shutdown();
 
-    log.debug(@src(), null, "This is a debug log with {[value]d}", .{ .value = 4 });
-    log.info(@src(), null, "This is an info log with {[string]s}", .{ .string = "asdf" });
-    log.warn(@src(), null, "This could be dangerous {[value]d}", .{ .value = -1 });
+    log.debug(@src(), .no_trace, "This is a debug log with {[value]d}", .{ .value = 4 });
+    log.info(@src(), .no_trace, "This is an info log with {[string]s}", .{ .string = "asdf" });
+    log.warn(@src(), .no_trace, "This could be dangerous {[value]d}", .{ .value = -1 });
     myFunc() catch |err| {
-        log.err(@src(), @errorReturnTrace(), "It was dangerous {[string]s}: {[error]t}", .{ .string = "dead", .@"error" = err });
+        log.err(@src(), .{ .error_trace = @errorReturnTrace() }, "It was dangerous {[string]s}: {[error]t}", .{ .string = "dead", .@"error" = err });
     };
 }
 

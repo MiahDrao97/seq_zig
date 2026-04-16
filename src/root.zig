@@ -29,6 +29,8 @@
 
 pub const log = @import("log.zig");
 
+pub const Trace = log.Trace;
+
 /// Configuration on the Seq server
 pub const SeqConfig = struct {
     /// Seq server base URL we're posting logs to (with or without trailing /).
@@ -95,7 +97,7 @@ pub const SeqBackgroundWorker = struct {
 
     fn worker(self: *SeqBackgroundWorker, io: Io, gpa: Allocator, config: SeqConfig) void {
         self.client = SeqClient.init(io, gpa, config) catch |err| {
-            if (@errorReturnTrace()) |t| debug.dumpStackTrace(t);
+            if (@errorReturnTrace()) |t| debug.dumpErrorReturnTrace(t);
             std_log.err("FATAL: SeqBackgroundWorker cannot start: {t}", .{err});
             self.signal.store(.stopped, .release);
             return;
@@ -105,7 +107,7 @@ pub const SeqBackgroundWorker = struct {
         // everything is initialized!
         self.signal.store(.running, .release);
         while (self.signal.load(.acquire) == .running) self.client.evaluate() catch |err| {
-            if (@errorReturnTrace()) |t| debug.dumpStackTrace(t);
+            if (@errorReturnTrace()) |t| debug.dumpErrorReturnTrace(t);
             switch (err) {
                 // any others that should kill the background thread?
                 error.OutOfMemory, error.ConnectionRefused => |e| {
@@ -121,13 +123,13 @@ pub const SeqBackgroundWorker = struct {
         if (self.client.flush()) {
             std_log.info("Seq client successfully flushed all logs.", .{});
         } else |err| {
-            if (@errorReturnTrace()) |t| debug.dumpStackTrace(t);
+            if (@errorReturnTrace()) |t| debug.dumpErrorReturnTrace(t);
             std_log.err("Failed to flush Seq client on shutdown: {t}", .{err});
         }
     }
 
     fn oomKill(self: *SeqBackgroundWorker, err_return_trace: ?*builtin.StackTrace) void {
-        if (err_return_trace) |t| debug.dumpStackTrace(t);
+        if (err_return_trace) |t| debug.dumpErrorReturnTrace(t);
         std_log.err("FATAL: SeqBackgroundWorker ran out of memory. Killing background thread...", .{});
         // kill the background worker
         self.signal.store(.stopped, .release);
@@ -138,7 +140,7 @@ pub const SeqBackgroundWorker = struct {
 /// Also calls `std.options.logFn` so whichever log function override you provide will still be respected.
 pub fn seqLog(
     comptime src: builtin.SourceLocation,
-    stack_trace: ?*const builtin.StackTrace,
+    trace: Trace,
     comptime level: SeqLogLevel,
     comptime scope: @EnumLiteral(),
     comptime log_format: []const u8,
@@ -171,7 +173,7 @@ pub fn seqLog(
 
         background_worker.client.writeLog(
             src,
-            stack_trace,
+            trace,
             level,
             scope,
             log_format,
@@ -240,7 +242,7 @@ const SeqClient = struct {
     fn writeLog(
         self: *SeqClient,
         src: builtin.SourceLocation,
-        stack_trace: ?*const builtin.StackTrace,
+        trace: Trace,
         comptime level: SeqLogLevel,
         comptime scope: @EnumLiteral(),
         comptime log_format: []const u8,
@@ -264,13 +266,21 @@ const SeqClient = struct {
                 ) catch return error.OutOfMemory;
                 break :write_location src_stream.written();
             },
-            .stack_trace = if (stack_trace) |st| write_trace: {
+            .stack_trace = write_trace: {
                 var st_stream: Io.Writer.Allocating = .init(self.arena.allocator());
                 const terminal: Io.Terminal = .{ .writer = &st_stream.writer, .mode = .no_color };
 
-                debug.writeStackTrace(st, terminal) catch return error.OutOfMemory;
+                switch (trace) {
+                    .stack_trace => |st| debug.writeStackTrace(st, terminal) catch return error.OutOfMemory,
+                    .error_trace => |maybe_err_tr| if (maybe_err_tr) |err_tr| {
+                        debug.writeErrorReturnTrace(err_tr, terminal) catch return error.OutOfMemory;
+                    } else {
+                        break :write_trace null;
+                    },
+                    .no_trace => break :write_trace null,
+                }
                 break :write_trace st_stream.written();
-            } else null,
+            },
             .@"@l" = level,
             .@"@t" = timestamp: {
                 var date_time_buf: [24]u8 = undefined;
