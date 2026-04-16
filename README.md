@@ -3,9 +3,14 @@
 Sends logs from a Zig application to a [Seq](https://datalust.co/) server for structured logging collection.
 
 ## Installation
-NOTE : Minimum version is Zig master `0.16.0-dev.2565+684032671`.
-
 Fetch via `zig` CLI:
+
+v0.1.0, which is compatible with Zig 0.16.0:
+```
+zig fetch https://github.com/MiahDrao97/seq_zig/archive/refs/tags/v0.1.0.tar.gz --save
+```
+
+Master:
 ```
 zig fetch https://github.com/MiahDrao97/seq_zig/archive/master.tar.gz --save
 ```
@@ -79,13 +84,14 @@ The first parameter is a comptime instance of `std.builtin.SourceLocation`, and 
 ```zig
 const log = seq_zig.log.scoped(.my_logger);
 
-// many non-error logs with start with `@src()` and `null` as the first 2 parameters, but keep in mind that each log level accepts a stack trace if you choose to provide one.
+// many non-error logs with start with `@src()` and a strack trace (or `.no_trace`) as the first 2 parameters
+// each log level accepts a stack trace if you choose to provide one (`.stack_trace` for `*const std.debug.StackTrace` and `.error_trace` for `?*const std.builtin.StackTrace`)
 // other than that, the logging API should feel pretty familiar.
-log.info(@src(), null, "This is an info log with the following message: {[message]s}", .{ .message = "Horray!" });
+log.info(@src(), .no_trace, "This is an info log with the following message: {[message]s}", .{ .message = "Horray!" });
 
 myFunc() catch |err| {
-    // passing in a stack trace
-    log.err(@src(), @errorReturnTrace(), "We had a problem: {[error]t}", .{ .@"error" = err });
+    // passing in an error return trace
+    log.err(@src(), .{ .error_trace = @errorReturnTrace() }, "We had a problem: {[error]t}", .{ .@"error" = err });
 };
 ```
 Now you may notice that the log format has named parameters, using a struct for the args rather than a tuple.

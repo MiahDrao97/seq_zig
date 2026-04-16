@@ -15,11 +15,11 @@ pub fn scoped(scope: @EnumLiteral()) type {
         /// Enabling verbose logging tends to make applications less performant.
         pub fn verbose(
             comptime src: SourceLocation,
-            stack_trace: ?*const std.builtin.StackTrace,
+            trace: Trace,
             comptime format: []const u8,
             args: anytype,
         ) void {
-            seq_zig.seqLog(src, stack_trace, .Verbose, scope, format, args);
+            seq_zig.seqLog(src, trace, .Verbose, scope, format, args);
         }
 
         /// Write a debug-level log:
@@ -27,55 +27,55 @@ pub fn scoped(scope: @EnumLiteral()) type {
         /// Most applications have Debug level disabled by default, but enabling Debug logs for a short period of time shouldn't produce an immense volume of logs.
         pub fn debug(
             comptime src: SourceLocation,
-            stack_trace: ?*const std.builtin.StackTrace,
+            trace: Trace,
             comptime format: []const u8,
             args: anytype,
         ) void {
-            seq_zig.seqLog(src, stack_trace, .Debug, scope, format, args);
+            seq_zig.seqLog(src, trace, .Debug, scope, format, args);
         }
 
         /// Write an info-level log:
         /// The default minimum log level
         pub fn info(
             comptime src: SourceLocation,
-            stack_trace: ?*const std.builtin.StackTrace,
+            trace: Trace,
             comptime format: []const u8,
             args: anytype,
         ) void {
-            seq_zig.seqLog(src, stack_trace, .Information, scope, format, args);
+            seq_zig.seqLog(src, trace, .Information, scope, format, args);
         }
 
         /// Write a warning-level log:
         /// Indicates that some data or value appears unusual, possibly indicative of a bug.
         pub fn warn(
             comptime src: SourceLocation,
-            stack_trace: ?*const std.builtin.StackTrace,
+            trace: Trace,
             comptime format: []const u8,
             args: anytype,
         ) void {
-            seq_zig.seqLog(src, stack_trace, .Warning, scope, format, args);
+            seq_zig.seqLog(src, trace, .Warning, scope, format, args);
         }
 
         /// Write an error-level log:
         /// Indicates that an error occurred, but not one that would cause the application to exit.
         pub fn err(
             comptime src: SourceLocation,
-            stack_trace: ?*const std.builtin.StackTrace,
+            trace: Trace,
             comptime format: []const u8,
             args: anytype,
         ) void {
-            seq_zig.seqLog(src, stack_trace, .Error, scope, format, args);
+            seq_zig.seqLog(src, trace, .Error, scope, format, args);
         }
 
         /// Write a fatal-level log:
         /// Indicates that a fatal error occurred, and the application is forced to exit.
         pub fn fatal(
             comptime src: SourceLocation,
-            stack_trace: ?*const std.builtin.StackTrace,
+            trace: Trace,
             comptime format: []const u8,
             args: anytype,
         ) void {
-            seq_zig.seqLog(src, stack_trace, .Fatal, scope, format, args);
+            seq_zig.seqLog(src, trace, .Fatal, scope, format, args);
         }
     };
 }
@@ -100,6 +100,17 @@ pub const err = default.err;
 
 /// Call fatal logging with the default scope
 pub const fatal = default.fatal;
+
+/// Pass in a trace if you want to include that in your structured log.
+/// As of Zig 0.16.0, error return traces and stack traces are different structs, so we need to be able to capture either one.
+pub const Trace = union(enum) {
+    /// Normal stack trace that can be captured using `std.debug.captureCurrentStackTrace(...)`
+    stack_trace: *const std.debug.StackTrace,
+    /// Error trace that can be captured using `@errorReturnTrace()`
+    error_trace: ?*const std.builtin.StackTrace,
+    /// Don't capture a stack trace
+    no_trace
+};
 
 const std = @import("std");
 const seq_zig = @import("root.zig");
