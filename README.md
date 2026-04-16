@@ -3,8 +3,6 @@
 Sends logs from a Zig application to a [Seq](https://datalust.co/) server for structured logging collection.
 
 ## Installation
-NOTE : Minimum version is Zig master `0.16.0-dev.2565+684032671`.
-
 Fetch via `zig` CLI:
 ```
 zig fetch https://github.com/MiahDrao97/seq_zig/archive/master.tar.gz --save
