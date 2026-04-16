@@ -435,7 +435,7 @@ const SeqClient = struct {
         {
             defer client.reset();
 
-            try client.writeLog(@src(), null, .Debug, .testing, "This is a log", .{});
+            try client.writeLog(@src(), .no_trace, .Debug, .testing, "This is a log", .{});
             const Body = SeqBody(@TypeOf(.{}));
 
             const written: []const u8 = mem.sliceTo(client.bytes.written(), 0);
@@ -450,7 +450,7 @@ const SeqClient = struct {
         {
             defer client.reset();
 
-            try client.writeLog(@src(), null, .Debug, .testing, "This is a log {d}: {s}", .{ 0, "yay" });
+            try client.writeLog(@src(), .no_trace, .Debug, .testing, "This is a log {d}: {s}", .{ 0, "yay" });
             const Body = SeqBody(@TypeOf(.{}));
 
             const written: []const u8 = mem.sliceTo(client.bytes.written(), 0);
@@ -466,7 +466,7 @@ const SeqClient = struct {
             defer client.reset();
             const args = .{ .num = 0, .message = "yay" };
 
-            try client.writeLog(@src(), null, .Debug, .testing, "This is a log {[num]d}: {[message]s}", args);
+            try client.writeLog(@src(), .no_trace, .Debug, .testing, "This is a log {[num]d}: {[message]s}", args);
             const Body = SeqBody(@TypeOf(args));
 
             const written: []const u8 = mem.sliceTo(client.bytes.written(), 0);
@@ -484,7 +484,7 @@ const SeqClient = struct {
             defer client.reset();
             const args = .{ .num = 0, .message = "yay" };
 
-            try client.writeLog(@src(), null, .Debug, .testing, "This is a log {[num]d}{[num]d}: {[message]s}", args);
+            try client.writeLog(@src(), .no_trace, .Debug, .testing, "This is a log {[num]d}{[num]d}: {[message]s}", args);
             const Body = SeqBody(@TypeOf(args));
 
             const written: []const u8 = mem.sliceTo(client.bytes.written(), 0);
@@ -502,7 +502,7 @@ const SeqClient = struct {
             defer client.reset();
             const args = .{ .num = 0, .message = "yay" };
 
-            try client.writeLog(@src(), null, .Debug, .testing, "This is a log {[num]d} {[num]d:0>4}: {[message]s}", args);
+            try client.writeLog(@src(), .no_trace, .Debug, .testing, "This is a log {[num]d} {[num]d:0>4}: {[message]s}", args);
             const Body = SeqBody(@TypeOf(args));
 
             const written: []const u8 = mem.sliceTo(client.bytes.written(), 0);
@@ -520,7 +520,7 @@ const SeqClient = struct {
             const args = .{ .num = 0, .message = "yay" };
 
             // below min logging level, so we shouldn't get any logs sent here
-            try client.writeLog(@src(), null, .Verbose, .testing, "This is a log {[num]d} {[num]d:0>4}: {[message]s}", args);
+            try client.writeLog(@src(), .no_trace, .Verbose, .testing, "This is a log {[num]d} {[num]d:0>4}: {[message]s}", args);
             try testing.expectEqual(0, client.bytes.written().len);
         }
     }
