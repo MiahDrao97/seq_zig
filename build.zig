@@ -11,7 +11,7 @@ pub fn build(b: *Build) void {
     const exe: *Compile = b.addExecutable(.{
         .name = "seq_zig",
         .root_module = b.createModule(.{
-            .root_source_file = b.path("src/main.zig"),
+            .root_source_file = b.path("src/run_test.zig"),
             .target = target,
             .optimize = optimize,
             .error_tracing = true,
@@ -46,12 +46,6 @@ pub fn build(b: *Build) void {
     // By making the run step depend on the default step, it will be run from the
     // installation directory rather than directly from within the cache directory.
     run_cmd.step.dependOn(b.getInstallStep());
-
-    // This allows the user to pass arguments to the application in the build
-    // command itself, like this: `zig build run -- arg1 arg2 etc`
-    if (b.args) |args| {
-        run_cmd.addArgs(args);
-    }
 
     // Creates an executable that will run `test` blocks from the provided module.
     // Here `mod` needs to define a target, which is why earlier we made sure to
