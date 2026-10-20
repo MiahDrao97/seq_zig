@@ -290,7 +290,7 @@ const SeqClient = struct {
 
         if (!@typeInfo(ArgsType).@"struct".is_tuple) {
             // copy fields from args struct, which then become parameterized values given to Seq
-            const params: [@typeInfo(ArgsType).@"struct".fields.len]ParamsAndSpecifiers = parametersAndSpecifiers(log_format, ArgsType);
+            const params: [@typeInfo(ArgsType).@"struct".field_names.len]ParamsAndSpecifiers = parametersAndSpecifiers(log_format, ArgsType);
             inline for (&params) |p| {
                 var stream: Io.Writer.Allocating = .init(self.arena.allocator());
                 stream.writer.print("{" ++ p.specifier ++ "}", .{@field(args, p.param)}) catch return error.OutOfMemory;
@@ -325,9 +325,9 @@ const SeqClient = struct {
     inline fn parametersAndSpecifiers(
         comptime log_format: []const u8,
         comptime TArgs: type,
-    ) [@typeInfo(TArgs).@"struct".fields.len]ParamsAndSpecifiers {
+    ) [@typeInfo(TArgs).@"struct".field_names.len]ParamsAndSpecifiers {
         comptime {
-            var result: [@typeInfo(TArgs).@"struct".fields.len]ParamsAndSpecifiers = undefined;
+            var result: [@typeInfo(TArgs).@"struct".field_names.len]ParamsAndSpecifiers = undefined;
             var idx: usize = 0;
             var begin_arg_name: usize = undefined;
             var begin_specifier: usize = undefined;
@@ -546,68 +546,82 @@ pub const SeqLogLevel = enum(u8) {
     Fatal = 5,
 
     fn lessThan(a: SeqLogLevel, b: SeqLogLevel) bool {
-        return @intFromEnum(a) < @intFromEnum(b);
+        return @backingInt(a) < @backingInt(b);
     }
 };
 
 fn SeqBody(comptime TBody: type) type {
     // additional props declared at root
-    const added_field_names, const added_field_types, const added_field_attrs = added_fields: {
+    // zig fmt: off
+    const added_field_names: []const [:0]const u8,
+    const added_field_types: []const type,
+    const added_field_attrs: []const Type.Struct.FieldAttributes = added_fields:
+    {
         const root = @import("root");
+        // zig fmt: on
         if (@hasDecl(root, "additional_log_props") and
             @typeInfo(@TypeOf(root.additional_log_props)) == .@"struct" and
             !@typeInfo(@TypeOf(root.additional_log_props)).@"struct".is_tuple)
         {
-            const props_fields = @typeInfo(@TypeOf(root.additional_log_props)).@"struct".fields;
-            var names: [props_fields.len][]const u8 = undefined;
-            var types: [props_fields.len]type = undefined;
-            var attrs: [props_fields.len]StructField.Attributes = undefined;
-            for (&names, &types, &attrs, props_fields) |*name, *t, *attr, field| {
-                name.* = field.name;
-                t.* = field.type;
-                attr.* = .{
-                    // MUST be comptime-set
-                    .@"comptime" = true,
-                    .@"align" = @alignOf(field.type),
-                    .default_value_ptr = @ptrCast(@as(*const field.type, &@field(root.additional_log_props, field.name))),
-                };
-            }
-            break :added_fields .{ names, types, attrs };
+            const additional_info: Type.Struct = @typeInfo(@TypeOf(root.additional_log_props)).@"struct";
+            break :added_fields .{
+                additional_info.field_names,
+                additional_info.field_types,
+                additional_info.field_attrs,
+            };
         }
-        break :added_fields .{ [_][]const u8{}, [_]type{}, [_]StructField.Attributes{} };
+        break :added_fields .{ &.{}, &.{}, &.{} };
     };
+
     // derived props from TBody
-    const derived_field_names, const derived_field_types, const derived_field_attrs =
+    // zig fmt: off
+    const derived_field_names: []const [:0]const u8,
+    const derived_field_types: []const type,
+    const derived_field_attrs: []const Type.Struct.FieldAttributes =
+    // zig fmt: on
         if (@typeInfo(TBody).@"struct".is_tuple)
             // don't add in fields from a tuple since they're all "0", "1", etc., and that's really meh for structured logging
-            .{ [_][]const u8{}, [_]type{}, [_]StructField.Attributes{} }
-        else derived_fields: {
-            var names: [@typeInfo(TBody).@"struct".fields.len][]const u8 = undefined;
-            var types: [@typeInfo(TBody).@"struct".fields.len]type = undefined;
-            var attrs: [@typeInfo(TBody).@"struct".fields.len]StructField.Attributes = undefined;
-            for (&names, &types, &attrs, @typeInfo(TBody).@"struct".fields) |*name, *t, *attr, field| {
-                name.* = field.name;
-                t.* = []const u8;
-                attr.* = .{
-                    .@"comptime" = false,
-                    .@"align" = @alignOf([]const u8),
-                    .default_value_ptr = @ptrCast(@as(*const []const u8, &"")),
-                };
-            }
-            break :derived_fields .{ names, types, attrs };
+            .{ &.{}, &.{}, &.{} }
+        else
+            .{
+                @typeInfo(TBody).@"struct".field_names,
+                &@as(
+                    [@typeInfo(TBody).@"struct".field_types.len]type,
+                    @splat([]const u8),
+                ),
+                &@as(
+                    [@typeInfo(TBody).@"struct".field_attrs.len]Type.Struct.FieldAttributes,
+                    @splat(.{
+                        .default_value_ptr = @ptrCast(@as(*const []const u8, &"")),
+                        .@"comptime" = false,
+                        .@"align" = @alignOf([]const u8),
+                    }),
+                ),
+            };
+
+    const field_names: []const [:0]const u8 =
+        added_field_names ++
+        derived_field_names ++
+        @as([]const [:0]const u8, &.{ "@t", "@l", "@m", "scope", "location", "stack_trace" });
+
+    const field_types: [field_names.len]type =
+        added_field_types.* ++
+        derived_field_types.* ++
+        .{ []const u8, SeqLogLevel, []const u8, []const u8, []const u8, ?[]const u8 };
+
+    const field_attrs: [field_names.len]Type.Struct.FieldAttributes =
+        added_field_attrs.* ++
+        derived_field_attrs.* ++
+        [_]Type.Struct.FieldAttributes{
+            .{ .default_value_ptr = null, .@"comptime" = false, .@"align" = @alignOf([]const u8) },
+            .{ .default_value_ptr = null, .@"comptime" = false, .@"align" = @alignOf(SeqLogLevel) },
+            .{ .default_value_ptr = @ptrCast(@as(*const []const u8, &"")), .@"comptime" = false, .@"align" = @alignOf([]const u8) },
+            .{ .default_value_ptr = @ptrCast(@as(*const []const u8, &"")), .@"comptime" = false, .@"align" = @alignOf([]const u8) },
+            .{ .default_value_ptr = @ptrCast(@as(*const []const u8, &"")), .@"comptime" = false, .@"align" = @alignOf([]const u8) },
+            .{ .default_value_ptr = @ptrCast(@as(*const ?[]const u8, &null)), .@"comptime" = false, .@"align" = @alignOf(?[]const u8) },
         };
 
-    const field_names = added_field_names ++ derived_field_names ++ .{ "@t", "@l", "@m", "scope", "location", "stack_trace" };
-    const field_types = added_field_types ++ derived_field_types ++ .{ []const u8, SeqLogLevel, []const u8, []const u8, []const u8, ?[]const u8 };
-    const field_attrs = added_field_attrs ++ derived_field_attrs ++ [_]StructField.Attributes{
-        .{ .default_value_ptr = null, .@"comptime" = false, .@"align" = @alignOf([]const u8) },
-        .{ .default_value_ptr = null, .@"comptime" = false, .@"align" = @alignOf(SeqLogLevel) },
-        .{ .default_value_ptr = @ptrCast(@as(*const []const u8, &"")), .@"comptime" = false, .@"align" = @alignOf([]const u8) },
-        .{ .default_value_ptr = @ptrCast(@as(*const []const u8, &"")), .@"comptime" = false, .@"align" = @alignOf([]const u8) },
-        .{ .default_value_ptr = @ptrCast(@as(*const []const u8, &"")), .@"comptime" = false, .@"align" = @alignOf([]const u8) },
-        .{ .default_value_ptr = @ptrCast(@as(*const ?[]const u8, &null)), .@"comptime" = false, .@"align" = @alignOf(?[]const u8) },
-    };
-    return @Struct(.auto, null, &field_names, &field_types, &field_attrs);
+    return @Struct(.auto, null, field_names, &field_types, &field_attrs);
 }
 
 comptime {
@@ -634,6 +648,6 @@ const Uri = std.Uri;
 const HttpClient = std.http.Client;
 const HttpRequest = HttpClient.Request;
 const HttpResponse = HttpClient.Response;
-const StructField = builtin.Type.StructField;
+const Type = builtin.Type;
 const LogLevel = std.log.Level;
 const std_log = std.log.scoped(.seq_zig);
