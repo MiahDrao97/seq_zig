@@ -393,6 +393,8 @@ const SeqClient = struct {
             },
         });
         defer request.deinit();
+        // we should always do this because we don't want to hold onto this memory forever
+        defer self.reset();
 
         try request.sendBodyComplete(entries);
         var buf: struct { redirect: [1024]u8, resp_body: [1024]u8 } = undefined;
@@ -404,14 +406,13 @@ const SeqClient = struct {
             defer stream.deinit();
 
             _ = reader.stream(&stream.writer, .unlimited) catch |err| switch (err) {
-                Io.Reader.StreamError.ReadFailed => return response.bodyErr().?,
-                Io.Reader.StreamError.WriteFailed => return error.OutOfMemory,
-                Io.Reader.StreamError.EndOfStream => {},
+                error.ReadFailed => return response.bodyErr().?,
+                error.WriteFailed => return error.OutOfMemory,
+                error.EndOfStream => {},
             };
             std_log.err("Seq server responded with non-success code {d}: {s}", .{ response.head.status, stream.written() });
             return error.NonSuccessResponse;
         }
-        self.reset();
     }
 
     fn reset(self: *SeqClient) void {
