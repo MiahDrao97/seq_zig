@@ -18,7 +18,7 @@ pub fn utcNowAsIsoString(io: Io, buf: *[24]u8) []const u8 {
     const year_day: YearAndDay = epoch_day.calculateYearDay();
     const month_day: MonthAndDay = year_day.calculateMonthDay();
 
-    return std.fmt.bufPrint(buf, "{:0>4}-{:0>2}-{:0>2}T{:0>2}:{:0>2}:{:0>2}.{:0>3}Z", .{
+    return std.mem.print(buf, "{:0>4}-{:0>2}-{:0>2}T{:0>2}:{:0>2}:{:0>2}.{:0>3}Z", .{
         @abs(year_day.year),
         @abs(month_day.month.numeric()),
         @abs(month_day.day_index + 1),
@@ -26,10 +26,7 @@ pub fn utcNowAsIsoString(io: Io, buf: *[24]u8) []const u8 {
         @abs(min),
         @abs(sec),
         @abs(ms),
-    }) catch {
-        var panic_buf: [64]u8 = undefined;
-        @panic(std.fmt.bufPrint(&panic_buf, "Buffer size {d} was too small for ISO datetime format.", .{buf.len}) catch &panic_buf);
-    };
+    }) catch std.debug.panic("Buffer size {d} was too small for ISO datetime format.", .{buf.len});
 }
 
 const std = @import("std");
