@@ -40,8 +40,8 @@ pub const SeqConfig = struct {
     api_key: []const u8,
     /// Minimum logging level enabled
     minimum_level: SeqLogLevel = switch (@import("builtin").mode) {
-        .Debug => .Debug,
-        .ReleaseSafe => .Information,
+        .debug => .Debug,
+        .safe => .Information,
         else => .Warning,
     },
     /// How often (in milliseconds) we flush collected logs to the Seq server.
